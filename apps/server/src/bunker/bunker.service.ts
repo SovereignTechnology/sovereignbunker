@@ -28,6 +28,12 @@ import WebSocket from 'ws';
 
 useWebSocketImplementation(WebSocket);
 
+/** A relay that takes longer than this to accept a NIP-46 reply is reported as slow. */
+const SLOW_PUBLISH_MS = 5_000;
+
+/** Relay-supplied text for a log line: printable ASCII only, bounded. */
+const printable = (value: unknown) => String(value).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+
 interface ActiveListener {
   relays: string[];
   /** Decrypted signer nsec (hex), kept so the watchdog can re-subscribe on disconnect. */
@@ -399,10 +405,52 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     );
 
     try {
-      await Promise.any(this.pool.publish(relays, responseEvent));
+      const started = Date.now();
+      const attempts = this.pool.publish(relays, responseEvent);
+      // Fire-and-forget, but never as an unhandled rejection (process guards treat those as fatal).
+      this.reportPublishOutcome(method, relays, attempts, started).catch((err: unknown) =>
+        this.logger.debug(`Could not report NIP-46 publish outcome: ${printable(err)}`),
+      );
+      await Promise.any(attempts);
       this.logger.log(`NIP-46 response sent for ${method} to ${clientPubkey.slice(0, 12)}...`);
     } catch (err) {
       this.logger.error(`Failed to publish NIP-46 response: ${err}`);
+    }
+  }
+
+  /**
+   * Once every relay has settled, report the ones that refused a reply or sat on it. The reply is
+   * already on its way (Promise.any resolves at the first acceptance), so this never delays it; it
+   * makes visible what "response sent" hides: a client listening only on a relay that rejected or
+   * delayed the reply is still waiting.
+   */
+  private async reportPublishOutcome(
+    method: string,
+    relays: string[],
+    attempts: Promise<string>[],
+    started: number,
+  ) {
+    const outcomes = await Promise.all(
+      attempts.map((attempt, i) =>
+        attempt.then(
+          () => ({ relay: relays[i] ?? '?', ok: true, ms: Date.now() - started, why: '' }),
+          (err: unknown) => ({
+            relay: relays[i] ?? '?',
+            ok: false,
+            ms: Date.now() - started,
+            why: printable(err),
+          }),
+        ),
+      ),
+    );
+    const parts = outcomes.map(
+      (o) => `${o.relay.replace('wss://', '')} ${o.ok ? 'ok' : `failed (${o.why})`} ${o.ms}ms`,
+    );
+    const summary = parts.join(', ');
+    if (outcomes.some((o) => !o.ok || o.ms > SLOW_PUBLISH_MS)) {
+      this.logger.warn(`NIP-46 ${method} reply publish: ${summary}`);
+    } else {
+      this.logger.debug(`NIP-46 ${method} reply publish: ${summary}`);
     }
   }
 

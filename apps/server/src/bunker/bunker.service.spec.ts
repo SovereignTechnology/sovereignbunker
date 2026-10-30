@@ -290,4 +290,79 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
   });
+
+  describe('reply publish outcome', () => {
+    const signerSk = generateSecretKey();
+    const clientPk = getPublicKey(generateSecretKey());
+    const relays = ['wss://a.example.com', 'wss://b.example.com'];
+
+    async function makeService(publish: ReturnType<typeof vi.fn>) {
+      const poolModule = await import('nostr-tools/pool');
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe: vi.fn().mockReturnValue({ close: vi.fn() }),
+          close: vi.fn(),
+          publish,
+          listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
+        };
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+      await svc.onModuleInit();
+      const internals = svc as unknown as {
+        logger: { warn(m: string): void; error(m: string): void };
+        sendResponse(r: object, m: string, pk: string, sk: Uint8Array, to: string[]): Promise<void>;
+      };
+      const warn = vi.spyOn(internals.logger, 'warn');
+      const error = vi.spyOn(internals.logger, 'error');
+      const send = () =>
+        internals.sendResponse({ id: 'r1', result: 'ack' }, 'ping', clientPk, signerSk, relays);
+      return { svc, warn, error, send };
+    }
+
+    const publishWarnings = (warn: ReturnType<typeof vi.spyOn>) =>
+      warn.mock.calls.map(([m]) => String(m)).filter((m) => m.includes('reply publish'));
+
+    it('warns with every relay outcome when one refuses the reply', async () => {
+      // Rejected lazily, so the promise never sits without a handler.
+      const refuse = () => Promise.reject(new Error('rate-limited: slow\n'));
+      const publish = vi.fn(() => [Promise.resolve('ok'), refuse()]);
+      const { svc, warn, send } = await makeService(publish);
+      await send();
+
+      await vi.waitFor(() => expect(publishWarnings(warn)).toHaveLength(1));
+      const [line] = publishWarnings(warn);
+      expect(line).toMatch(/^NIP-46 ping reply publish: a\.example\.com ok \d+ms, /);
+      expect(line).toContain('b.example.com failed (Error: rate-limited: slow?)');
+
+      await svc.onModuleDestroy();
+    });
+
+    it('stays quiet when every relay accepts promptly', async () => {
+      const publish = vi.fn().mockReturnValue([Promise.resolve('ok'), Promise.resolve('ok')]);
+      const { svc, warn, send } = await makeService(publish);
+      await send();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(publishWarnings(warn)).toHaveLength(0);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('contains a pool result it cannot read instead of rejecting unhandled', async () => {
+      const { svc, error, send } = await makeService(vi.fn().mockReturnValue(undefined));
+      await send();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to publish NIP-46 response'),
+      );
+
+      await svc.onModuleDestroy();
+    });
+  });
 });
