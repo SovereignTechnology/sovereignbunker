@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import * as nip44 from 'nostr-tools/nip44';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { NOSTR_CONSTANTS } from '@bunker46/config';
 import { BunkerService } from './bunker.service.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
@@ -203,6 +206,86 @@ describe('BunkerService', () => {
       runWatchdog();
 
       expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+  });
+
+  describe('unsupported methods', () => {
+    const signerSk = generateSecretKey();
+    const signerPk = getPublicKey(signerSk);
+    const clientSk = generateSecretKey();
+    const clientPk = getPublicKey(clientSk);
+    const relays = ['wss://r.example.com'];
+
+    async function makeService() {
+      const poolModule = await import('nostr-tools/pool');
+      const publish = vi.fn().mockReturnValue([Promise.resolve('ok')]);
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe: vi.fn().mockReturnValue({ close: vi.fn() }),
+          close: vi.fn(),
+          publish,
+          listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
+        };
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+      await svc.onModuleInit();
+      return { svc, publish };
+    }
+
+    // Hand the service a request exactly as a relay would deliver it: encrypted by the client.
+    // rpcHandler has no handleRequest here, so reaching the normal path would throw.
+    async function deliver(svc: BunkerService, request: unknown) {
+      const ck = nip44.v2.utils.getConversationKey(clientSk, signerPk);
+      const event = { pubkey: clientPk, content: nip44.v2.encrypt(JSON.stringify(request), ck) };
+      const internals = svc as unknown as {
+        handleIncomingEvent(e: object, nsec: string, pk: string, r: string[]): Promise<void>;
+      };
+      await internals.handleIncomingEvent(event, bytesToHex(signerSk), signerPk, relays);
+    }
+
+    function readReply(publish: ReturnType<typeof vi.fn>) {
+      const [to, event] = publish.mock.calls[0] as [string[], { content: string; tags: string[][] }];
+      const ck = nip44.v2.utils.getConversationKey(clientSk, signerPk);
+      return { to, tags: event.tags, reply: JSON.parse(nip44.v2.decrypt(event.content, ck)) };
+    }
+
+    it('replies with an error to an unknown method such as logout', async () => {
+      const { svc, publish } = await makeService();
+      await deliver(svc, { id: 'req-1', method: 'logout', params: [] });
+
+      expect(publish).toHaveBeenCalledTimes(1);
+      const { to, tags, reply } = readReply(publish);
+      expect(to).toEqual(relays);
+      expect(tags).toEqual([['p', clientPk]]);
+      expect(reply).toEqual({ id: 'req-1', error: 'unsupported method: logout' });
+
+      await svc.onModuleDestroy();
+    });
+
+    it('neutralises characters outside [A-Za-z0-9_] in the echoed method', async () => {
+      const { svc, publish } = await makeService();
+      await deliver(svc, { id: 'req-2', method: 'log\nout<x>', params: [] });
+
+      expect(readReply(publish).reply).toEqual({
+        id: 'req-2',
+        error: 'unsupported method: log?out?x?',
+      });
+
+      await svc.onModuleDestroy();
+    });
+
+    it('still drops a known method whose params are malformed', async () => {
+      const { svc, publish } = await makeService();
+      await deliver(svc, { id: 'req-3', method: 'sign_event', params: [42] });
+
+      expect(publish).not.toHaveBeenCalled();
 
       await svc.onModuleDestroy();
     });

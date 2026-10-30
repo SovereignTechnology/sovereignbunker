@@ -12,8 +12,11 @@ import * as nip44 from 'nostr-tools/nip44';
 import * as nip04 from 'nostr-tools/nip04';
 import { BunkerRpcHandler } from './bunker-rpc.handler.js';
 import {
+  Nip46Method,
+  Nip46RequestEnvelopeSchema,
   Nip46RequestSchema,
   SafeRelayUrlSchema,
+  type Nip46Response,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
 import { NOSTR_CONSTANTS, NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN } from '@bunker46/config';
@@ -312,15 +315,33 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    let parsed;
+    let raw: unknown;
     try {
-      parsed = Nip46RequestSchema.safeParse(JSON.parse(decryptedContent));
+      raw = JSON.parse(decryptedContent);
     } catch {
       this.logger.warn(`Failed to parse NIP-46 JSON from ${clientPubkey.slice(0, 12)}...`);
       return;
     }
 
+    const parsed = Nip46RequestSchema.safeParse(raw);
     if (!parsed.success) {
+      // NIP-46: requests with unknown or unsupported methods MUST be replied with an error.
+      // Without a reply the client waits for its own timeout (e.g. nostr-tools' `logout`).
+      const envelope = Nip46RequestEnvelopeSchema.safeParse(raw);
+      if (envelope.success && !Nip46Method.safeParse(envelope.data.method).success) {
+        const method = envelope.data.method.replace(/[^A-Za-z0-9_]/g, '?');
+        this.logger.warn(
+          `Unsupported NIP-46 method ${method} from ${clientPubkey.slice(0, 12)}... – replying with an error`,
+        );
+        await this.sendResponse(
+          { id: envelope.data.id, error: `unsupported method: ${method}` },
+          method,
+          clientPubkey,
+          signerSecretKey,
+          relays,
+        );
+        return;
+      }
       this.logger.warn(`Invalid NIP-46 request schema from ${clientPubkey.slice(0, 12)}...`);
       return;
     }
@@ -352,6 +373,17 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       (nsec) => getPublicKey(hexToBytes(nsec)),
     );
 
+    await this.sendResponse(response, parsed.data.method, clientPubkey, signerSecretKey, relays);
+  }
+
+  /** Encrypt a NIP-46 response to the client and publish it on the listener's relays. */
+  private async sendResponse(
+    response: Nip46Response,
+    method: string,
+    clientPubkey: string,
+    signerSecretKey: Uint8Array,
+    relays: string[],
+  ) {
     const responseJson = JSON.stringify(response);
     const conversationKey = nip44.v2.utils.getConversationKey(signerSecretKey, clientPubkey);
     const encryptedResponse = nip44.v2.encrypt(responseJson, conversationKey);
@@ -368,9 +400,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
     try {
       await Promise.any(this.pool.publish(relays, responseEvent));
-      this.logger.log(
-        `NIP-46 response sent for ${parsed.data.method} to ${clientPubkey.slice(0, 12)}...`,
-      );
+      this.logger.log(`NIP-46 response sent for ${method} to ${clientPubkey.slice(0, 12)}...`);
     } catch (err) {
       this.logger.error(`Failed to publish NIP-46 response: ${err}`);
     }
