@@ -207,4 +207,82 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
   });
+
+  describe('replay guard', () => {
+    type OnEvent = (event: { id: string; pubkey: string; content: string }) => Promise<void>;
+
+    async function makeService() {
+      const poolModule = await import('nostr-tools/pool');
+      const subscribe = vi.fn().mockReturnValue({ close: vi.fn() });
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe,
+          close: vi.fn(),
+          publish: vi.fn().mockResolvedValue(undefined),
+          // Empty status => every relay reads as dropped, so the watchdog re-subscribes.
+          listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
+        };
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+      await svc.onModuleInit();
+      // Count the requests that reach the decrypt-and-answer path without running it.
+      const internals = svc as unknown as { handleIncomingEvent: () => Promise<void> };
+      const handle = vi.spyOn(internals, 'handleIncomingEvent');
+      handle.mockResolvedValue(undefined);
+      const onEventOfCall = (n: number) =>
+        (subscribe.mock.calls[n]?.[2] as { onevent: OnEvent }).onevent;
+      return { svc, subscribe, handle, onEventOfCall };
+    }
+
+    const request = (id: string) => ({ id, pubkey: 'c'.repeat(64), content: 'ciphertext' });
+
+    it('only asks relays for requests inside the since window', async () => {
+      const { svc, subscribe } = await makeService();
+      const before = Math.floor(Date.now() / 1000);
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), ['wss://relay.example.com']);
+      const after = Math.floor(Date.now() / 1000);
+
+      const filter = subscribe.mock.calls[0]?.[1] as { since?: number };
+      expect(filter.since).toBeGreaterThanOrEqual(before - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S);
+      expect(filter.since).toBeLessThanOrEqual(after - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('answers a request once when relays deliver it again', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), ['wss://relay.example.com']);
+      const onevent = onEventOfCall(0);
+
+      await onevent(request('1'.repeat(64)));
+      await onevent(request('1'.repeat(64)));
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await onevent(request('2'.repeat(64)));
+      expect(handle).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('remembers handled requests across a watchdog re-subscribe', async () => {
+      // 2026-10-30: a relay drop made the watchdog re-subscribe, relays handed back 15 requests
+      // that had already been answered, and the bunker signed all 15 again.
+      const { svc, subscribe, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), ['wss://relay.example.com']);
+      await onEventOfCall(0)(request('3'.repeat(64)));
+
+      (svc as unknown as { checkConnections(): void }).checkConnections();
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      await onEventOfCall(1)(request('3'.repeat(64)));
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+  });
 });

@@ -46,6 +46,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
   private pool: SimplePool;
   private activeListeners = new Map<string, ActiveListener>();
   private pendingSecrets = new Map<string, PendingSecretInfo>();
+  /** Replay guard: request event id -> when it was handled (ms), oldest first. */
+  private handledEventIds = new Map<string, number>();
   private watchdogHandle?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -231,9 +233,19 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
     const sub = this.pool.subscribe(
       effectiveRelays,
-      { kinds: [NOSTR_CONSTANTS.NIP46_KIND], '#p': [signerPubkeyHex] },
+      {
+        kinds: [NOSTR_CONSTANTS.NIP46_KIND],
+        '#p': [signerPubkeyHex],
+        since: Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
+      },
       {
         onevent: async (event) => {
+          if (!this.markHandled(event.id)) {
+            this.logger.debug(
+              `Ignoring re-delivered NIP-46 event ${event.id.slice(0, 8)} for ${signerPubkeyHex.slice(0, 12)}...`,
+            );
+            return;
+          }
           try {
             await this.handleIncomingEvent(event, signerNsecHex, signerPubkeyHex, effectiveRelays);
           } catch (err) {
@@ -280,6 +292,25 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       this.activeListeners.delete(signerPubkeyHex);
       this.logger.log(`Stopped listener for ${signerPubkeyHex.slice(0, 12)}...`);
     }
+  }
+
+  /**
+   * Replay guard. Relays hand back stored requests whenever the watchdog re-subscribes, so the same
+   * request event can arrive many times; answering it again re-signs an old request. Returns true
+   * only the first time an event id is seen. Ids are forgotten once they are older than the `since`
+   * window (relays no longer return them) or when the map exceeds its cap.
+   */
+  private markHandled(eventId: string): boolean {
+    if (this.handledEventIds.has(eventId)) return false;
+    const now = Date.now();
+    this.handledEventIds.set(eventId, now);
+    const cutoff = now - (NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S + 60) * 1000;
+    for (const [id, handledAt] of this.handledEventIds) {
+      const overCap = this.handledEventIds.size > NOSTR_CONSTANTS.NIP46_HANDLED_EVENT_IDS_MAX;
+      if (handledAt >= cutoff && !overCap) break;
+      this.handledEventIds.delete(id);
+    }
+    return true;
   }
 
   isListening(signerPubkeyHex: string): boolean {
