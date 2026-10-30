@@ -285,4 +285,95 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
   });
+
+  describe('per-relay subscriptions', () => {
+    type Params = {
+      onclose: (reasons: { url: string; reason: string }[]) => void;
+      oneose: () => void;
+    };
+    const PK = 'a'.repeat(64);
+    const NSEC = 'b'.repeat(64);
+    const two = ['wss://r1.example.com', 'wss://r2.example.com'];
+
+    async function makeService(status = new Map<string, boolean>()) {
+      const poolModule = await import('nostr-tools/pool');
+      const subscribe = vi.fn().mockImplementation(() => ({ close: vi.fn() }));
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe,
+          close: vi.fn(),
+          publish: vi.fn().mockReturnValue([]),
+          listConnectionStatus: vi.fn().mockReturnValue(status),
+        };
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+      await svc.onModuleInit();
+      const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
+      const paramsOf = (n: number) => subscribe.mock.calls[n]?.[2] as Params;
+      return { svc, subscribe, relaysOf, paramsOf };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('subscribes to each relay separately', async () => {
+      const { svc, subscribe, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, two);
+
+      expect(subscribe).toHaveBeenCalledTimes(2);
+      expect(relaysOf(0)).toEqual(['wss://r1.example.com']);
+      expect(relaysOf(1)).toEqual(['wss://r2.example.com']);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('re-subscribes a relay that closed the subscription, after a backoff', async () => {
+      // 2026-10-30: relay.ditto.pub answers a 21st subscription on one connection with
+      // CLOSED "error: too many subscriptions"; the bunker never noticed and stayed deaf there.
+      vi.useFakeTimers();
+      const { svc, subscribe, relaysOf, paramsOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, two);
+
+      const closed = [{ url: 'wss://r1.example.com/', reason: 'error: too many subscriptions' }];
+      paramsOf(0).onclose(closed);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      vi.advanceTimersByTime(5_000);
+      expect(subscribe).toHaveBeenCalledTimes(3);
+      expect(relaysOf(2)).toEqual(['wss://r1.example.com']);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('does not re-subscribe after closing the subscription itself', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, paramsOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, ['wss://r1.example.com']);
+      svc.stopListeningForKey(PK);
+
+      paramsOf(0).onclose([{ url: 'wss://r1.example.com/', reason: 'closed by caller' }]);
+      vi.advanceTimersByTime(60_000);
+      expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('re-opens only the relay whose connection dropped', async () => {
+      const status = new Map([['wss://r2.example.com/', true]]);
+      const { svc, subscribe, relaysOf } = await makeService(status);
+      svc.startListeningForKey(PK, NSEC, two);
+
+      (svc as unknown as { checkConnections(): void }).checkConnections();
+      expect(subscribe).toHaveBeenCalledTimes(3);
+      expect(relaysOf(2)).toEqual(['wss://r1.example.com']);
+
+      await svc.onModuleDestroy();
+    });
+  });
 });

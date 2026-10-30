@@ -25,10 +25,18 @@ import WebSocket from 'ws';
 
 useWebSocketImplementation(WebSocket);
 
+/** Delay before re-subscribing a relay that closed our subscription, by consecutive attempt. */
+const RESUBSCRIBE_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
+
+/** Relay-supplied text for a log line: printable ASCII only, bounded. */
+const printable = (value: unknown) => String(value).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+
 interface ActiveListener {
   relays: string[];
-  /** Decrypted signer nsec (hex), kept so the watchdog can re-subscribe on disconnect. */
+  /** Decrypted signer nsec (hex), kept so the listener can be rebuilt with merged relays. */
   nsecHex: string;
+  /** Re-open one relay's subscription only (the watchdog, after that relay's socket dropped). */
+  reopen: (url: string) => void;
   close: () => void;
 }
 
@@ -110,10 +118,6 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     if (typeof this.pool.listConnectionStatus !== 'function') return;
 
     const status = this.pool.listConnectionStatus();
-    // Collect first, then restart: restartListener() mutates activeListeners
-    // (delete + re-add), which would otherwise re-enter this iteration and loop
-    // forever while a relay stays down.
-    const toRestart: string[] = [];
     for (const [pubkey, listener] of this.activeListeners) {
       const dead = listener.relays.filter((url) => status.get(normalizeURL(url)) !== true);
       if (dead.length === 0) continue;
@@ -121,22 +125,10 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(
         `Relay(s) disconnected for ${pubkey.slice(0, 12)}...: ${dead.join(', ')} – re-subscribing`,
       );
-      toRestart.push(pubkey);
+      // Only the dropped relays. Rebuilding every relay's subscription on each drop churned the
+      // healthy relays (one flapping relay re-subscribed all of them every few minutes).
+      for (const url of dead) listener.reopen(url);
     }
-    for (const pubkey of toRestart) {
-      this.restartListener(pubkey);
-    }
-  }
-
-  /** Tear down and recreate a listener's subscription across all its relays. */
-  private restartListener(pubkey: string) {
-    const listener = this.activeListeners.get(pubkey);
-    if (!listener) return;
-
-    const { relays, nsecHex } = listener;
-    listener.close();
-    this.activeListeners.delete(pubkey);
-    this.startListeningForKey(pubkey, nsecHex, relays);
   }
 
   registerPendingSecret(signerPubkey: string, secret: string, info: PendingSecretInfo) {
@@ -231,34 +223,81 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       return this.startListeningForKey(signerPubkeyHex, signerNsecHex, mergedRelays);
     }
 
-    const sub = this.pool.subscribe(
-      effectiveRelays,
-      {
-        kinds: [NOSTR_CONSTANTS.NIP46_KIND],
-        '#p': [signerPubkeyHex],
-        since: Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
-      },
-      {
-        onevent: async (event) => {
-          if (!this.markHandled(event.id)) {
-            this.logger.debug(
-              `Ignoring re-delivered NIP-46 event ${event.id.slice(0, 8)} for ${signerPubkeyHex.slice(0, 12)}...`,
-            );
-            return;
-          }
-          try {
-            await this.handleIncomingEvent(event, signerNsecHex, signerPubkeyHex, effectiveRelays);
-          } catch (err) {
-            this.logger.error(`Error handling NIP-46 event: ${err}`);
-          }
+    const label = signerPubkeyHex.slice(0, 12);
+    const onevent = async (event: { id: string; pubkey: string; content: string }) => {
+      if (!this.markHandled(event.id)) {
+        this.logger.debug(
+          `Ignoring re-delivered NIP-46 event ${event.id.slice(0, 8)} for ${label}...`,
+        );
+        return;
+      }
+      try {
+        await this.handleIncomingEvent(event, signerNsecHex, signerPubkeyHex, effectiveRelays);
+      } catch (err) {
+        this.logger.error(`Error handling NIP-46 event: ${err}`);
+      }
+    };
+
+    // One subscription per relay. SimplePool reports onclose only once EVERY relay of a
+    // subscription has closed, so with one subscription across all relays a relay that sent
+    // CLOSED (e.g. "error: too many subscriptions") went unnoticed, and the watchdog, which checks
+    // sockets only, never revived it: requests published only to that relay were lost.
+    const subs = new Map<string, { close: () => void }>();
+    const attempts = new Map<string, number>();
+    let stopped = false;
+    const open = (url: string) => {
+      let closedByUs = false;
+      let handle: { close: () => void } | undefined;
+      const sub = this.pool.subscribe(
+        [url],
+        {
+          kinds: [NOSTR_CONSTANTS.NIP46_KIND],
+          '#p': [signerPubkeyHex],
+          since: Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
         },
-      },
-    );
+        {
+          onevent,
+          oneose: () => attempts.set(url, 0),
+          onclose: (reasons) => {
+            if (closedByUs || stopped || subs.get(url) !== handle) return;
+            const n = attempts.get(url) ?? 0;
+            attempts.set(url, n + 1);
+            const step = Math.min(n, RESUBSCRIBE_BACKOFF_MS.length - 1);
+            const delay = RESUBSCRIBE_BACKOFF_MS[step] ?? 60_000;
+            const why = printable(reasons.map((r) => r.reason).join('; '));
+            this.logger.warn(
+              `${url} closed the NIP-46 subscription for ${label}...: ${why} – re-subscribing in ${delay / 1000}s`,
+            );
+            const timer = setTimeout(() => {
+              if (!stopped && subs.get(url) === handle) open(url);
+            }, delay);
+            timer.unref?.();
+          },
+        },
+      );
+      handle = {
+        close: () => {
+          closedByUs = true;
+          sub.close();
+        },
+      };
+      subs.set(url, handle);
+    };
+    for (const url of effectiveRelays) open(url);
 
     this.activeListeners.set(signerPubkeyHex, {
       relays: effectiveRelays,
       nsecHex: signerNsecHex,
-      close: () => sub.close(),
+      reopen: (url) => {
+        if (stopped) return;
+        subs.get(url)?.close();
+        open(url);
+      },
+      close: () => {
+        stopped = true;
+        for (const handle of subs.values()) handle.close();
+        subs.clear();
+      },
     });
 
     this.logger.log(
