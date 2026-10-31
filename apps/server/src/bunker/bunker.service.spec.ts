@@ -33,7 +33,7 @@ describe('BunkerService', () => {
       relayConfig: { findMany: vi.fn().mockResolvedValue([]) },
     };
     encryption = { decrypt: vi.fn().mockReturnValue('decrypted-nsec-hex') };
-    rpcHandler = { setPendingSecretLookup: vi.fn() };
+    rpcHandler = { setPendingSecretLookup: vi.fn(), setBaseRelayLookup: vi.fn() };
     service = new BunkerService(
       rpcHandler as BunkerRpcHandler,
       prisma as PrismaService,
@@ -45,6 +45,18 @@ describe('BunkerService', () => {
 
   afterEach(async () => {
     await service.onModuleDestroy();
+  });
+
+  describe('switch_relays relay lookup', () => {
+    it("hands the RPC handler the owner's relay_configs, else the defaults", async () => {
+      const lookup = vi.mocked(rpcHandler.setBaseRelayLookup!).mock.calls[0][0];
+      vi.mocked(prisma.relayConfig!.findMany).mockResolvedValueOnce([
+        { url: 'wss://a.example.com' },
+        { url: 'wss://b.example.com' },
+      ] as never);
+      await expect(lookup('u1')).resolves.toEqual(['wss://a.example.com', 'wss://b.example.com']);
+      await expect(lookup('u2')).resolves.toEqual([...NOSTR_CONSTANTS.DEFAULT_RELAYS]);
+    });
   });
 
   describe('pending secrets', () => {
