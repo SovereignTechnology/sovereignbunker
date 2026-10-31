@@ -376,4 +376,141 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
   });
+
+  describe('self-ping liveness', () => {
+    type Event = { id: string; pubkey: string; content: string };
+    type OnEvent = (event: Event) => Promise<void> | void;
+    const PK = 'a'.repeat(64);
+    const NSEC = 'b'.repeat(64);
+    const R1 = 'wss://r1.example.com';
+    const R2 = 'wss://r2.example.com';
+    const FIRST = NOSTR_CONSTANTS.NIP46_SELF_PING_FIRST_MS;
+    const EVERY = NOSTR_CONSTANTS.NIP46_SELF_PING_INTERVAL_MS;
+    const WAIT = NOSTR_CONSTANTS.NIP46_SELF_PING_TIMEOUT_MS;
+
+    async function makeService(outcome: () => Promise<string> = () => Promise.resolve('ok')) {
+      const poolModule = await import('nostr-tools/pool');
+      const subscribe = vi.fn().mockImplementation(() => ({ close: vi.fn() }));
+      const published: { relays: string[]; event: Event }[] = [];
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe,
+          close: vi.fn(),
+          publish: vi.fn((relays: string[], event: Event) => {
+            published.push({ relays, event });
+            return [outcome()];
+          }),
+          // Both sockets up, so the watchdog never re-opens anything here.
+          listConnectionStatus: vi.fn().mockReturnValue(
+            new Map([
+              [`${R1}/`, true],
+              [`${R2}/`, true],
+            ]),
+          ),
+        };
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+      await svc.onModuleInit();
+      const internals = svc as unknown as { handleIncomingEvent: () => Promise<void> };
+      const handle = vi.spyOn(internals, 'handleIncomingEvent').mockResolvedValue(undefined);
+      const onEventOf = (n: number) =>
+        (subscribe.mock.calls[n]?.[2] as { onevent: OnEvent }).onevent;
+      const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
+      return { svc, subscribe, published, handle, onEventOf, relaysOf };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('drops its own self-pings; only the relay a ping went to can echo it', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, published, handle, onEventOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1, R2]);
+
+      await vi.advanceTimersByTimeAsync(FIRST);
+      expect(published.map((p) => p.relays)).toEqual([[R1], [R2]]);
+      const [toR1, toR2] = published.map((p) => p.event);
+      await onEventOf(1)(toR1!); // r1's self-ping, copied over to r2 by the relays
+      await onEventOf(0)(toR1!);
+      await onEventOf(1)(toR2!);
+      expect(handle).not.toHaveBeenCalled();
+
+      await onEventOf(0)({ id: '4'.repeat(64), pubkey: 'c'.repeat(64), content: 'ciphertext' });
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(WAIT);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('re-subscribes a relay that echoed before, once it misses twice in a row', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, published, onEventOf, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1]);
+
+      await vi.advanceTimersByTimeAsync(FIRST);
+      await onEventOf(0)(published[0]!.event);
+
+      await vi.advanceTimersByTimeAsync(EVERY + WAIT + 1);
+      expect(published).toHaveLength(2);
+      expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(EVERY);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+      expect(relaysOf(1)).toEqual([R1]);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('never re-subscribes a relay that has not echoed once', async () => {
+      // relay.damus.io on 2026-10-31: accepted fresh-key kind-24133 events and delivered them to
+      // nobody. Silence from such a relay says nothing about the subscription.
+      vi.useFakeTimers();
+      const { svc, subscribe, published } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1]);
+
+      await vi.advanceTimersByTimeAsync(FIRST + 4 * EVERY + WAIT + 1);
+      expect(published).toHaveLength(5);
+      expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('does not count a self-ping the relay refused as a miss', async () => {
+      vi.useFakeTimers();
+      let refuse = false;
+      const { svc, subscribe, published, onEventOf } = await makeService(() =>
+        refuse ? Promise.reject(new Error('blocked: kind not allowed')) : Promise.resolve('ok'),
+      );
+      svc.startListeningForKey(PK, NSEC, [R1]);
+      await vi.advanceTimersByTimeAsync(FIRST);
+      await onEventOf(0)(published[0]!.event);
+
+      refuse = true;
+      await vi.advanceTimersByTimeAsync(3 * EVERY + WAIT + 1);
+      expect(published).toHaveLength(4);
+      expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('stops pinging once the listener is stopped', async () => {
+      vi.useFakeTimers();
+      const { svc, published } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1]);
+      svc.stopListeningForKey(PK);
+
+      await vi.advanceTimersByTimeAsync(FIRST + EVERY);
+      expect(published).toHaveLength(0);
+
+      await svc.onModuleDestroy();
+    });
+  });
 });

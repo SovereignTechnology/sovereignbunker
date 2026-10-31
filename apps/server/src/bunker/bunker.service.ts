@@ -245,6 +245,51 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     const subs = new Map<string, { close: () => void }>();
     const attempts = new Map<string, number>();
     let stopped = false;
+
+    // Self-ping liveness. A relay can stop delivering to a subscription while its socket stays up
+    // and without sending CLOSED, which neither onclose nor the socket watchdog sees. So every few
+    // minutes the signer publishes a kind-24133 to itself on each relay alone and expects it back
+    // on that relay's subscription. Only a relay that has echoed before counts misses: some accept
+    // the event and deliver it to nobody (relay.damus.io did for fresh keys on 2026-10-31) or
+    // refuse the kind (relay.nos.social), and for those silence proves nothing.
+    const selfPubkey = getPublicKey(hexToBytes(signerNsecHex));
+    const selfPings = new Map<string, string>(); // self-ping event id -> the relay it went to
+    const liveness = new Map<string, { verified: boolean; misses: number }>();
+    const livenessOf = (url: string) => {
+      let state = liveness.get(url);
+      if (!state) {
+        state = { verified: false, misses: 0 };
+        liveness.set(url, state);
+      }
+      return state;
+    };
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const later = (fn: () => void, ms: number) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        if (!stopped) fn();
+      }, ms);
+      timer.unref?.();
+      timers.add(timer);
+    };
+    const onRelayEvent = (url: string, event: { id: string; pubkey: string; content: string }) => {
+      // The signer's own events are self-pings (this round's, a late one, or one a relay copied
+      // from another relay), never requests; only the relay it was sent to counts as an echo.
+      if (event.pubkey === selfPubkey) {
+        if (selfPings.get(event.id) === url) {
+          selfPings.delete(event.id);
+          const state = livenessOf(url);
+          if (!state.verified) {
+            this.logger.debug(`${url} echoes the NIP-46 self-ping for ${label}...`);
+          }
+          state.verified = true;
+          state.misses = 0;
+        }
+        return;
+      }
+      return onevent(event);
+    };
+
     const open = (url: string) => {
       let closedByUs = false;
       let handle: { close: () => void } | undefined;
@@ -256,7 +301,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
           since: Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
         },
         {
-          onevent,
+          onevent: (event) => onRelayEvent(url, event),
           oneose: () => attempts.set(url, 0),
           onclose: (reasons) => {
             if (closedByUs || stopped || subs.get(url) !== handle) return;
@@ -285,6 +330,52 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     };
     for (const url of effectiveRelays) open(url);
 
+    const selfPing = (url: string) => {
+      const event = finalizeEvent(
+        {
+          kind: NOSTR_CONSTANTS.NIP46_KIND,
+          content: 'self-ping',
+          tags: [['p', signerPubkeyHex]],
+          created_at: Math.floor(Date.now() / 1000),
+        },
+        hexToBytes(signerNsecHex),
+      );
+      selfPings.set(event.id, url);
+      let sent: Promise<string>[];
+      try {
+        sent = this.pool.publish([url], event);
+      } catch {
+        selfPings.delete(event.id);
+        return;
+      }
+      const settled = ([outcome]: PromiseSettledResult<string>[]) => {
+        // A relay that refused or never took the event says nothing about our subscription.
+        if (outcome?.status !== 'fulfilled') {
+          selfPings.delete(event.id);
+          return;
+        }
+        later(() => {
+          if (!selfPings.delete(event.id)) return; // it came back
+          const state = livenessOf(url);
+          if (!state.verified) return;
+          state.misses += 1;
+          if (state.misses < NOSTR_CONSTANTS.NIP46_SELF_PING_MISSES) return;
+          this.logger.warn(
+            `${url} missed ${state.misses} NIP-46 self-pings in a row for ${label}... – re-subscribing`,
+          );
+          state.misses = 0;
+          subs.get(url)?.close();
+          open(url);
+        }, NOSTR_CONSTANTS.NIP46_SELF_PING_TIMEOUT_MS);
+      };
+      void Promise.allSettled(sent).then(settled, () => selfPings.delete(event.id));
+    };
+    const round = () => {
+      for (const url of effectiveRelays) selfPing(url);
+      later(round, NOSTR_CONSTANTS.NIP46_SELF_PING_INTERVAL_MS);
+    };
+    later(round, NOSTR_CONSTANTS.NIP46_SELF_PING_FIRST_MS);
+
     this.activeListeners.set(signerPubkeyHex, {
       relays: effectiveRelays,
       nsecHex: signerNsecHex,
@@ -295,6 +386,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       },
       close: () => {
         stopped = true;
+        for (const timer of timers) clearTimeout(timer);
+        timers.clear();
         for (const handle of subs.values()) handle.close();
         subs.clear();
       },
