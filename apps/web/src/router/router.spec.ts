@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { createRouter, createMemoryHistory } from 'vue-router';
+import { createRouter, createMemoryHistory, type RouteLocationNormalized } from 'vue-router';
 
 const mockUseAuthStore = vi.fn();
 
@@ -55,7 +55,7 @@ describe('Router guards', () => {
 
   describe('the real guard', () => {
     const to = (fullPath: string, meta: Record<string, unknown>) =>
-      ({ fullPath, meta }) as unknown as import('vue-router').RouteLocationNormalized;
+      ({ fullPath, meta }) as unknown as RouteLocationNormalized;
 
     it('sends a signed-out visitor of an approval link to login, carrying the link', async () => {
       const { authGuard } = await import('./index.js');

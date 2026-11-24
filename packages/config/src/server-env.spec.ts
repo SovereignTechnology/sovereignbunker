@@ -204,6 +204,18 @@ describe('serverEnvSchema', () => {
         expect(result.data.PUBLIC_BASE_URL).toBe('https://signer.example.test:50217');
     });
 
+    it('accepts a plain http origin with a port and an IPv6 host', () => {
+      for (const value of [
+        'http://localhost:5173',
+        'http://100.64.0.3:8080',
+        'https://[::1]:8443',
+      ]) {
+        const result = parse({ PUBLIC_BASE_URL: value });
+        expect(result.success).toBe(true);
+        if (result.success) expect(result.data.PUBLIC_BASE_URL).toBe(value);
+      }
+    });
+
     it('keeps a path prefix for a reverse proxy mounted under one', () => {
       const result = parse({ PUBLIC_BASE_URL: 'https://example.test/bunker' });
       expect(result.success).toBe(true);
@@ -216,6 +228,9 @@ describe('serverEnvSchema', () => {
       'https://user:pass@example.test',
       'https://example.test/?x=1',
       'https://example.test/#frag',
+      'https://example.test?x=1',
+      'https://example.test#frag',
+      'https://@example.test',
       'not a url',
     ])('rejects %s', (value) => {
       expect(parse({ PUBLIC_BASE_URL: value }).success).toBe(false);

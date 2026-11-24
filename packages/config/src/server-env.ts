@@ -58,20 +58,12 @@ export const serverEnvSchema = z
       z
         .string()
         .url()
-        .refine((raw) => {
-          try {
-            const u = new URL(raw);
-            return (
-              (u.protocol === 'https:' || u.protocol === 'http:') &&
-              !u.username &&
-              !u.password &&
-              !u.search &&
-              !u.hash
-            );
-          } catch {
-            return false;
-          }
-        }, 'PUBLIC_BASE_URL must be an http(s) URL without credentials, query or fragment')
+        // No URL parsing here (the package has no DOM or Node types): scheme, then an authority
+        // with no credentials (`@`), then an optional path, and nothing after it (`?` or `#`).
+        .refine(
+          (raw) => /^https?:\/\/[^\s/?#@\\]+(?:\/[^\s?#]*)?$/i.test(raw),
+          'PUBLIC_BASE_URL must be an http(s) URL without credentials, query or fragment',
+        )
         .transform((raw) => raw.replace(/\/+$/, ''))
         .optional(),
     ),
