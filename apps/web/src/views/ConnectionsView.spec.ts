@@ -17,7 +17,12 @@ vi.mock('qrcode', () => ({ toDataURL: vi.fn().mockResolvedValue('data:image/png;
 import ConnectionsView from './ConnectionsView.vue';
 
 const CLIENT = 'b'.repeat(64);
-const KEY = { id: 'key-1', publicKey: 'a'.repeat(64), label: 'Main', createdAt: '2026-11-01T00:00:00Z' };
+const KEY = {
+  id: 'key-1',
+  publicKey: 'a'.repeat(64),
+  label: 'Main',
+  createdAt: '2026-11-01T00:00:00Z',
+};
 const uri = (perms?: string) =>
   `nostrconnect://${CLIENT}?relay=${encodeURIComponent('wss://relay.example.com')}&secret=s3cret&name=BIES` +
   (perms === undefined ? '' : `&perms=${encodeURIComponent(perms)}`);
@@ -26,7 +31,13 @@ async function mountView() {
   apiGet.mockImplementation(async (path: string) => (path === '/connections' ? [] : [KEY]));
   apiPost.mockImplementation(async (path: string) => {
     if (path === '/bunker/parse-uri') {
-      return { type: 'nostrconnect', clientPubkey: CLIENT, relays: ['wss://relay.example.com'], secret: 's3cret', name: 'BIES' };
+      return {
+        type: 'nostrconnect',
+        clientPubkey: CLIENT,
+        relays: ['wss://relay.example.com'],
+        secret: 's3cret',
+        name: 'BIES',
+      };
     }
     if (path === '/bunker/generate-bunker-uri') return { uri: 'bunker://x' };
     return {};

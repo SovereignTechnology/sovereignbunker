@@ -106,10 +106,13 @@ describe('connectActivityStream', () => {
   });
 
   it('says nothing after the caller stopped it', async () => {
-    fetchMock.mockImplementation((_url: string, init: { signal: AbortSignal }) =>
-      new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
-      }),
+    fetchMock.mockImplementation(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          );
+        }),
     );
     const onUnavailable = vi.fn();
     const stop = connectActivityStream({ onActivity: vi.fn(), onUnavailable });

@@ -186,7 +186,8 @@ describe('serverEnvSchema', () => {
     });
   });
   describe('PUBLIC_BASE_URL', () => {
-    const parse = (extra: Record<string, string>) => serverEnvSchema.safeParse({ ...baseEnv, ...extra });
+    const parse = (extra: Record<string, string>) =>
+      serverEnvSchema.safeParse({ ...baseEnv, ...extra });
 
     it('is optional: unset and empty both mean no approval link', () => {
       for (const value of [undefined, '', '   ']) {
@@ -199,7 +200,8 @@ describe('serverEnvSchema', () => {
     it('drops a trailing slash so links are built as base + /approvals/<token>', () => {
       const result = parse({ PUBLIC_BASE_URL: 'https://signer.example.test:50217/' });
       expect(result.success).toBe(true);
-      if (result.success) expect(result.data.PUBLIC_BASE_URL).toBe('https://signer.example.test:50217');
+      if (result.success)
+        expect(result.data.PUBLIC_BASE_URL).toBe('https://signer.example.test:50217');
     });
 
     it('keeps a path prefix for a reverse proxy mounted under one', () => {
@@ -221,7 +223,8 @@ describe('serverEnvSchema', () => {
   });
 
   describe('ASK_APPROVAL_TTL_MS', () => {
-    const parse = (extra: Record<string, string>) => serverEnvSchema.safeParse({ ...baseEnv, ...extra });
+    const parse = (extra: Record<string, string>) =>
+      serverEnvSchema.safeParse({ ...baseEnv, ...extra });
 
     it('defaults to 100 s, under the 240 s a BIES client waits', () => {
       const result = parse({});

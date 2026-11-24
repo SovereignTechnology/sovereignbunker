@@ -188,7 +188,10 @@ export class ConnectionsService {
     const have = new Set(existing.map(permKey));
     const granted = existing
       .filter((e) => e.allowed)
-      .map((e) => ({ method: e.method as PermissionDescriptor['method'], kind: e.kind ?? undefined }));
+      .map((e) => ({
+        method: e.method as PermissionDescriptor['method'],
+        kind: e.kind ?? undefined,
+      }));
     const fresh = permissions.filter((p) => {
       const key = permKey(p);
       if (have.has(key) || checkPermission(granted, p)) return false;
@@ -211,7 +214,11 @@ export class ConnectionsService {
    * Grant permissions for good ("always allow" on an approval). Owner-checked. A pending row for the
    * same method/kind is replaced by the grant, and one that is already granted is left alone.
    */
-  async grantPermissions(connectionId: string, userId: string, permissions: PermissionDescriptor[]) {
+  async grantPermissions(
+    connectionId: string,
+    userId: string,
+    permissions: PermissionDescriptor[],
+  ) {
     const conn = await this.prisma.bunkerConnection.findUnique({ where: { id: connectionId } });
     if (!conn || conn.userId !== userId) throw new NotFoundException('Connection not found');
     if (permissions.length === 0) return;

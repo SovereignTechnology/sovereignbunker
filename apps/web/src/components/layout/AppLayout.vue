@@ -14,11 +14,7 @@ import {
   BellRing,
 } from '@lucide/vue';
 import { useAuthStore, $auth } from '@/stores/auth';
-import {
-  $pendingApprovalCount,
-  startApprovalWatch,
-  stopApprovalWatch,
-} from '@/stores/approvals';
+import { $pendingApprovalCount, startApprovalWatch, stopApprovalWatch } from '@/stores/approvals';
 import { useUiStore, $ui } from '@/stores/ui';
 import { useSettingsStore } from '@/stores/settings';
 import Button from '@/components/ui/Button.vue';

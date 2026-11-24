@@ -12,7 +12,9 @@ let routeParams: Record<string, string> = {};
 vi.mock('vue-router', () => ({ useRoute: () => ({ params: routeParams }) }));
 
 // The store would otherwise open a stream and timers of its own; the view only reads and refreshes.
-vi.mock('@/composables/useActivityStream', () => ({ connectActivityStream: () => () => undefined }));
+vi.mock('@/composables/useActivityStream', () => ({
+  connectActivityStream: () => () => undefined,
+}));
 
 import ApprovalsView from './ApprovalsView.vue';
 import { $approvals, $approvalsLoaded } from '@/stores/approvals';
@@ -99,7 +101,10 @@ describe('ApprovalsView', () => {
 
   it('puts the request the link pointed at first and marks it', async () => {
     const w = mountView(
-      [item({ token: 'other', connectionName: 'Other' }), item({ token: 'wanted', connectionName: 'Wanted' })],
+      [
+        item({ token: 'other', connectionName: 'Other' }),
+        item({ token: 'wanted', connectionName: 'Wanted' }),
+      ],
       { token: 'wanted' },
     );
     await flushPromises();

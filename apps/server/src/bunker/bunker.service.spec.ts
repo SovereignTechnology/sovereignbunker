@@ -171,7 +171,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await service.onModuleInit();
       const pubkey = 'd'.repeat(64);
@@ -214,7 +214,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const runWatchdog = () => (svc as unknown as { checkConnections(): void }).checkConnections();
@@ -295,7 +295,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       // Count the requests that reach the decrypt-and-answer path without running it.
@@ -539,7 +539,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
@@ -750,7 +750,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const internals = svc as unknown as { handleIncomingEvent: () => Promise<boolean> };
@@ -963,7 +963,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       return { svc, publish };
@@ -1044,7 +1044,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
-      approvals as ApprovalService,
+        approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const internals = svc as unknown as {
@@ -1137,10 +1137,9 @@ describe('BunkerService', () => {
           listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
         };
       });
-      const real = new ApprovalService(
-        { ttlMs: 100_000, publicBaseUrl },
-        { publishUserActivity: vi.fn().mockResolvedValue(undefined) } as unknown as EventsService,
-      );
+      const real = new ApprovalService({ ttlMs: 100_000, publicBaseUrl }, {
+        publishUserActivity: vi.fn().mockResolvedValue(undefined),
+      } as unknown as EventsService);
       const passes: Array<{ id: string; resolution: unknown }> = [];
       const handleRequest = vi.fn(async (...args: unknown[]) => {
         const req = args[2] as Nip46Request;

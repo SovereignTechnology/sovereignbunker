@@ -26,10 +26,7 @@ const labels = (w: ReturnType<typeof mount>) =>
 describe('PermissionPicker', () => {
   describe('permissions', () => {
     it('shows what will be granted', () => {
-      const { w } = mountPicker([
-        { method: 'sign_event', kind: 1 },
-        { method: 'nip44_decrypt' },
-      ]);
+      const { w } = mountPicker([{ method: 'sign_event', kind: 1 }, { method: 'nip44_decrypt' }]);
       expect(labels(w)).toEqual(['sign_event:1', 'nip44_decrypt']);
     });
 
@@ -95,7 +92,9 @@ describe('PermissionPicker', () => {
     it('shows "Ask each time" as the choice when asking is on and login is not granted', () => {
       const { w } = mountPicker([{ method: 'sign_event', kind: 1 }], true);
       expect((w.get('[data-testid="login-ask"]').element as HTMLInputElement).checked).toBe(true);
-      expect((w.get('[data-testid="login-always"]').element as HTMLInputElement).checked).toBe(false);
+      expect((w.get('[data-testid="login-always"]').element as HTMLInputElement).checked).toBe(
+        false,
+      );
       expect(w.find('[data-testid="login-warning"]').exists()).toBe(false);
     });
 

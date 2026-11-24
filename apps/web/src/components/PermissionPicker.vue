@@ -40,10 +40,7 @@ function toggleMethod(method: string) {
   // Toggle a method-level (all-kinds) grant. Granting all kinds replaces any kind-scoped rows for it.
   permissions.value = isAllKinds(method)
     ? permissions.value.filter((p) => p.method !== method)
-    : [
-        ...permissions.value.filter((p) => p.method !== method),
-        { method } as PermissionDescriptor,
-      ];
+    : [...permissions.value.filter((p) => p.method !== method), { method } as PermissionDescriptor];
 }
 
 function remove(p: PermissionDescriptor) {
@@ -254,9 +251,9 @@ function chooseLogin(choice: 'ask' | 'always') {
       <span>
         <strong>Ask me</strong> when this app needs something it has no permission for
         <span class="block text-xs text-muted-foreground">
-          The app waits while you decide on the Approvals page. Only for apps that understand a
-          wait (a NIP-46 <code class="font-mono">auth_url</code> reply, as BIES does). Off: such
-          requests are refused at once.
+          The app waits while you decide on the Approvals page. Only for apps that understand a wait
+          (a NIP-46 <code class="font-mono">auth_url</code> reply, as BIES does). Off: such requests
+          are refused at once.
         </span>
       </span>
     </label>

@@ -232,14 +232,14 @@ export class ConnectionsController {
   }
 
   @Patch(':id/approval-mode')
-  async setApprovalMode(
-    @Req() req: AuthReq,
-    @Param('id') id: string,
-    @Body() body: unknown,
-  ) {
+  async setApprovalMode(@Req() req: AuthReq, @Param('id') id: string, @Body() body: unknown) {
     const parsed = SetApprovalModeBodySchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException('mode must be DENY or ASK');
-    const updated = await this.connectionsService.setApprovalMode(id, req.user.sub, parsed.data.mode);
+    const updated = await this.connectionsService.setApprovalMode(
+      id,
+      req.user.sub,
+      parsed.data.mode,
+    );
     // Back to DENY: whatever is being held is answered (as denied) now.
     if (parsed.data.mode === 'DENY') this.approvals.cancelForConnection(id);
     return updated;

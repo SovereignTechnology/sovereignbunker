@@ -2,14 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { safeRedirectPath } from './redirect.js';
 
 describe('safeRedirectPath', () => {
-  it.each([
-    '/approvals/abc_DEF-123',
-    '/approvals',
-    '/connections/clx1?tab=logs',
-    '/dashboard#top',
-  ])('keeps the in-app path %s', (path) => {
-    expect(safeRedirectPath(path)).toBe(path);
-  });
+  it.each(['/approvals/abc_DEF-123', '/approvals', '/connections/clx1?tab=logs', '/dashboard#top'])(
+    'keeps the in-app path %s',
+    (path) => {
+      expect(safeRedirectPath(path)).toBe(path);
+    },
+  );
 
   it.each([
     ['another origin', 'https://evil.example/approvals'],

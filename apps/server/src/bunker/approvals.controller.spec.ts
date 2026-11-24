@@ -15,7 +15,10 @@ const as = (userId: string) => ({ user: { sub: userId } }) as unknown as Req;
 
 describe('ApprovalsController', () => {
   let approvals: ApprovalService;
-  let connections: { grantPermissions: ReturnType<typeof vi.fn>; denyRequests: ReturnType<typeof vi.fn> };
+  let connections: {
+    grantPermissions: ReturnType<typeof vi.fn>;
+    denyRequests: ReturnType<typeof vi.fn>;
+  };
   let controller: ApprovalsController;
   let hold: HeldRequest;
 
@@ -34,10 +37,9 @@ describe('ApprovalsController', () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    approvals = new ApprovalService(
-      { ttlMs: 100_000, publicBaseUrl: undefined },
-      { publishUserActivity: vi.fn().mockResolvedValue(undefined) } as unknown as EventsService,
-    );
+    approvals = new ApprovalService({ ttlMs: 100_000, publicBaseUrl: undefined }, {
+      publishUserActivity: vi.fn().mockResolvedValue(undefined),
+    } as unknown as EventsService);
     connections = {
       grantPermissions: vi.fn().mockResolvedValue(undefined),
       denyRequests: vi.fn().mockResolvedValue(undefined),
@@ -57,15 +59,21 @@ describe('ApprovalsController', () => {
       expect(guards).toEqual(expect.arrayContaining([JwtAuthGuard, TotpVerifiedGuard]));
     });
 
-    it.each(['list', 'get', 'approve', 'deny'] as const)('rate-limits %s on both throttlers', (name) => {
-      const handler = ApprovalsController.prototype[name];
-      expect(Reflect.getMetadata(`${THROTTLER_LIMIT}default`, handler)).toBeGreaterThan(0);
-      expect(Reflect.getMetadata(`${THROTTLER_LIMIT}auth`, handler)).toBeGreaterThan(0);
-    });
+    it.each(['list', 'get', 'approve', 'deny'] as const)(
+      'rate-limits %s on both throttlers',
+      (name) => {
+        const handler = ApprovalsController.prototype[name];
+        expect(Reflect.getMetadata(`${THROTTLER_LIMIT}default`, handler)).toBeGreaterThan(0);
+        expect(Reflect.getMetadata(`${THROTTLER_LIMIT}auth`, handler)).toBeGreaterThan(0);
+      },
+    );
 
     it('allows far fewer decisions than reads', () => {
       const limit = (name: 'list' | 'approve') =>
-        Reflect.getMetadata(`${THROTTLER_LIMIT}auth`, ApprovalsController.prototype[name]) as number;
+        Reflect.getMetadata(
+          `${THROTTLER_LIMIT}auth`,
+          ApprovalsController.prototype[name],
+        ) as number;
       expect(limit('approve')).toBeLessThan(limit('list'));
     });
   });
@@ -85,7 +93,13 @@ describe('ApprovalsController', () => {
     });
 
     it('refuses a token of the wrong shape before looking anything up', () => {
-      for (const bad of ['', 'short', 'has space in it xxxxxxxxxxxxxxxx', '../../etc/passwd', 'x'.repeat(200)]) {
+      for (const bad of [
+        '',
+        'short',
+        'has space in it xxxxxxxxxxxxxxxx',
+        '../../etc/passwd',
+        'x'.repeat(200),
+      ]) {
         expect(() => controller.get(as('user-1'), bad)).toThrow(BadRequestException);
       }
     });
@@ -108,9 +122,11 @@ describe('ApprovalsController', () => {
     });
 
     it('once: answers this request and grants nothing', async () => {
-      await expect(controller.approve(as('user-1'), hold.token, { mode: 'once' })).resolves.toEqual({
-        success: true,
-      });
+      await expect(controller.approve(as('user-1'), hold.token, { mode: 'once' })).resolves.toEqual(
+        {
+          success: true,
+        },
+      );
       expect(await hold.decision).toBe('approved_once');
       expect(connections.grantPermissions).not.toHaveBeenCalled();
     });
@@ -133,16 +149,16 @@ describe('ApprovalsController', () => {
 
     it('always: when the grant fails the request is NOT approved and stays held', async () => {
       connections.grantPermissions.mockRejectedValue(new NotFoundException('Connection not found'));
-      await expect(controller.approve(as('user-1'), hold.token, { mode: 'always' })).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(
+        controller.approve(as('user-1'), hold.token, { mode: 'always' }),
+      ).rejects.toThrow(NotFoundException);
       expect(await settled(hold)).toBe('pending');
     });
 
     it("another user's token: 404, nothing granted, the hold untouched", async () => {
-      await expect(controller.approve(as('user-2'), hold.token, { mode: 'always' })).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(
+        controller.approve(as('user-2'), hold.token, { mode: 'always' }),
+      ).rejects.toThrow(NotFoundException);
       expect(connections.grantPermissions).not.toHaveBeenCalled();
       expect(await settled(hold)).toBe('pending');
     });

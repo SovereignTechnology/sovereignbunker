@@ -97,7 +97,9 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
         VALUES
           ('legacy-conn', ${user.id}, ${nsecKey.id}, 'legacy-client', 'Legacy',
            'ACTIVE'::"ConnectionStatus", ARRAY[]::TEXT[], false, now(), now())`;
-      const conn = await prisma.bunkerConnection.findUniqueOrThrow({ where: { id: 'legacy-conn' } });
+      const conn = await prisma.bunkerConnection.findUniqueOrThrow({
+        where: { id: 'legacy-conn' },
+      });
       expect(conn.approvalMode).toBe('DENY');
     });
 
@@ -162,7 +164,9 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
       expect(kept[0]).toMatchObject({ id: 'm-granted', allowed: true });
       // Everything else is untouched.
       expect(await rows(conn.id, 'nip04_decrypt')).toHaveLength(1);
-      expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id, kind: 1 } })).toBe(1);
+      expect(
+        await prisma.connectionPermission.count({ where: { connectionId: conn.id, kind: 1 } }),
+      ).toBe(1);
     });
 
     it('running the cleanup again changes nothing', async () => {
@@ -173,7 +177,9 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
       await prisma.$executeRawUnsafe(sql);
       const once = await prisma.connectionPermission.count({ where: { connectionId: conn.id } });
       await prisma.$executeRawUnsafe(sql);
-      expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(once);
+      expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(
+        once,
+      );
       expect(once).toBe(1);
     });
 
@@ -243,7 +249,13 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
   describe('seeding', () => {
     it('an empty chosen list creates a connection that holds no permission at all', async () => {
       const { user, nsecKey } = await seedKey();
-      const conn = await service.createConnection(user.id, nsecKey.id, 'client-x', { name: 'X' }, []);
+      const conn = await service.createConnection(
+        user.id,
+        nsecKey.id,
+        'client-x',
+        { name: 'X' },
+        [],
+      );
       expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(0);
     });
 
@@ -256,13 +268,10 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
 
     it('a repeated entry in the chosen list is stored once', async () => {
       const { user, nsecKey } = await seedKey();
-      const conn = await service.createConnection(
-        user.id,
-        nsecKey.id,
-        'client-z',
-        { name: 'Z' },
-        [{ method: 'nip44_decrypt' }, { method: 'nip44_decrypt' }],
-      );
+      const conn = await service.createConnection(user.id, nsecKey.id, 'client-z', { name: 'Z' }, [
+        { method: 'nip44_decrypt' },
+        { method: 'nip44_decrypt' },
+      ]);
       expect(await rows(conn.id, 'nip44_decrypt')).toHaveLength(1);
     });
   });

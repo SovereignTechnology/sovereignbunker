@@ -206,7 +206,7 @@ connection, or "Ask me instead of refusing" on its detail page). The signer then
 2. You open that link (it needs your normal login, and 2FA if you use it) and choose **Allow once**, **Always allow** or **Deny** on the Approvals page. A badge in the navigation shows how many requests are waiting.
 3. The signer sends the client the final reply under the same request id: the signed result, or the unchanged `Permission denied for sign_event kind:N`. A request nobody answers within `ASK_APPROVAL_TTL_MS` is refused with that same text.
 
-*Allow once* signs that one request and stores nothing. *Always allow* stores the permission, so the next request needs no answer.
+_Allow once_ signs that one request and stores nothing. _Always allow_ stores the permission, so the next request needs no answer.
 Always allowing a login (`sign_event` kind 27235) lets that connection sign in to any site as you, including sites where signing in can delete an
 account, so the page asks you to confirm it.
 
@@ -215,10 +215,10 @@ will treat the interim reply as an answer or an error. Revoking, deleting or swi
 At most 10 requests wait per connection and 200 in total; past that, requests are refused as before. Waiting requests live in memory, so a signer
 restart refuses them (the client can ask again).
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PUBLIC_BASE_URL` | unset | The origin you open the web UI at, e.g. `https://bunker.example.com` (a private or tailnet address works too). Set it for ask mode: without it the signer still holds the request (it shows on the Approvals page) but cannot build the link, so it sends the client no `auth_url` reply and the client just waits. `http(s)` only, no credentials, query or fragment. |
-| `ASK_APPROVAL_TTL_MS` | `100000` | How long a request waits for your answer, 5000 to 200000. Keep it below the client's own wait (BIES waits about 240 s). |
+| Variable              | Default  | Meaning                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUBLIC_BASE_URL`     | unset    | The origin you open the web UI at, e.g. `https://bunker.example.com` (a private or tailnet address works too). Set it for ask mode: without it the signer still holds the request (it shows on the Approvals page) but cannot build the link, so it sends the client no `auth_url` reply and the client just waits. `http(s)` only, no credentials, query or fragment. |
+| `ASK_APPROVAL_TTL_MS` | `100000` | How long a request waits for your answer, 5000 to 200000. Keep it below the client's own wait (BIES waits about 240 s).                                                                                                                                                                                                                                                |
 
 ## Security
 

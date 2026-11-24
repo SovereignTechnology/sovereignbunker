@@ -11,18 +11,23 @@ describe('permissionsFromUri', () => {
     ]);
   });
 
-  it.each([null, undefined, ''])('falls back to the defaults when nothing was asked (%j)', (raw) => {
-    expect(permissionsFromUri(raw)).toEqual([...DEFAULT_CONNECTION_PERMISSIONS]);
-  });
+  it.each([null, undefined, ''])(
+    'falls back to the defaults when nothing was asked (%j)',
+    (raw) => {
+      expect(permissionsFromUri(raw)).toEqual([...DEFAULT_CONNECTION_PERMISSIONS]);
+    },
+  );
 
   it('falls back to the defaults when nothing usable was asked', () => {
-    expect(permissionsFromUri('connect,ping,telepathy')).toEqual([...DEFAULT_CONNECTION_PERMISSIONS]);
+    expect(permissionsFromUri('connect,ping,telepathy')).toEqual([
+      ...DEFAULT_CONNECTION_PERMISSIONS,
+    ]);
   });
 
   it('leaves out methods that need no grant, and unknown ones', () => {
-    expect(permissionsFromUri('connect,ping,get_public_key,switch_relays,sign_event:1,bogus')).toEqual(
-      [{ method: 'sign_event', kind: 1 }],
-    );
+    expect(
+      permissionsFromUri('connect,ping,get_public_key,switch_relays,sign_event:1,bogus'),
+    ).toEqual([{ method: 'sign_event', kind: 1 }]);
   });
 
   it('drops a kind that is not a non-negative number: it would make the server refuse the list', () => {

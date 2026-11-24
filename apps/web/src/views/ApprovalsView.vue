@@ -16,7 +16,9 @@ const approvals = useStore($approvals);
 const loaded = useStore($approvalsLoaded);
 
 /** The request the link in the client pointed at, if this page was opened from one. */
-const focusToken = computed(() => (typeof route.params.token === 'string' ? route.params.token : ''));
+const focusToken = computed(() =>
+  typeof route.params.token === 'string' ? route.params.token : '',
+);
 
 const busy = ref('');
 const error = ref('');
@@ -71,8 +73,7 @@ const what = (a: PendingApprovalDto) =>
   a.method === 'sign_event'
     ? (KIND_LABELS[a.kind ?? -1] ?? 'Sign an event')
     : (METHOD_LABELS[a.method] ?? a.method);
-const permission = (a: PendingApprovalDto) =>
-  a.kind != null ? `${a.method}:${a.kind}` : a.method;
+const permission = (a: PendingApprovalDto) => (a.kind != null ? `${a.method}:${a.kind}` : a.method);
 const secondsLeft = (a: PendingApprovalDto) =>
   Math.max(0, Math.ceil((Date.parse(a.expiresAt) - now.value) / 1000));
 
@@ -186,11 +187,8 @@ function askAlways(a: PendingApprovalDto) {
           class="rounded-lg bg-muted/50 border border-border p-3 mb-3 text-sm"
           data-testid="approval-preview"
         >
-          <pre
-            v-if="a.preview.content"
-            class="whitespace-pre-wrap break-words font-mono text-xs"
-            >{{ a.preview.content }}{{ a.preview.contentTruncated ? ' …' : '' }}</pre
-          >
+          <pre v-if="a.preview.content" class="whitespace-pre-wrap break-words font-mono text-xs"
+            >{{ a.preview.content }}{{ a.preview.contentTruncated ? ' …' : '' }}</pre>
           <p v-if="a.preview.tagNames?.length" class="text-xs text-muted-foreground mt-2">
             Tags:
             <span v-for="name in a.preview.tagNames" :key="name" class="font-mono mr-1">{{
@@ -204,9 +202,9 @@ function askAlways(a: PendingApprovalDto) {
           class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 mb-3 text-sm"
           data-testid="approval-always-warning"
         >
-          Always allowing this lets <strong>{{ a.connectionName }}</strong> sign in to any website as
-          you without asking again, including sites where signing in can delete an account. Choose
-          <em>Allow once</em> to be asked each time.
+          Always allowing this lets <strong>{{ a.connectionName }}</strong> sign in to any website
+          as you without asking again, including sites where signing in can delete an account.
+          Choose <em>Allow once</em> to be asked each time.
         </div>
 
         <div class="flex flex-wrap gap-2">

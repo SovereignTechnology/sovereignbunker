@@ -340,7 +340,8 @@ export class BunkerRpcHandler {
           clientPubkey: connection.clientPubkey,
           requestId: request.id,
           permission: deniedPermission,
-          preview: request.method === 'sign_event' ? previewSignEvent(request.params[0]) : undefined,
+          preview:
+            request.method === 'sign_event' ? previewSignEvent(request.params[0]) : undefined,
         });
         if (hold) {
           this.logger.log(

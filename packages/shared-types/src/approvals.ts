@@ -10,9 +10,7 @@ export const ApprovalModeSchema = z.enum(['DENY', 'ASK']);
 export type ApprovalMode = z.infer<typeof ApprovalModeSchema>;
 
 /** POST /api/approvals/:token/approve. `once` signs this request only; `always` also grants it. */
-export const ApproveApprovalBodySchema = z
-  .object({ mode: z.enum(['once', 'always']) })
-  .strict();
+export const ApproveApprovalBodySchema = z.object({ mode: z.enum(['once', 'always']) }).strict();
 export type ApproveApprovalBody = z.infer<typeof ApproveApprovalBodySchema>;
 
 /** PATCH /api/connections/:id/approval-mode */

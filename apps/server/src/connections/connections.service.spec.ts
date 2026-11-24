@@ -400,7 +400,7 @@ describe('ConnectionsService', () => {
   });
 
   describe('grantPermissions', () => {
-    it('throws NotFound when the connection is not the user\'s, and grants nothing', async () => {
+    it("throws NotFound when the connection is not the user's, and grants nothing", async () => {
       vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
         id: 'conn-1',
         userId: 'someone-else',
@@ -450,7 +450,7 @@ describe('ConnectionsService', () => {
   });
 
   describe('setApprovalMode', () => {
-    it('throws NotFound for a connection that is not the user\'s, and changes nothing', async () => {
+    it("throws NotFound for a connection that is not the user's, and changes nothing", async () => {
       vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
         id: 'conn-1',
         userId: 'someone-else',

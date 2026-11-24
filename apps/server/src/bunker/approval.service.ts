@@ -1,4 +1,10 @@
-import { Inject, Injectable, Logger, NotFoundException, type OnModuleDestroy } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  type OnModuleDestroy,
+} from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import {
   APPROVAL_CONFIG_INJECTION_TOKEN,
@@ -22,11 +28,7 @@ import { EventsService } from '../events/events.service.js';
  * - `cancelled`: the connection was revoked, deleted or switched back to DENY, or the signer stopped.
  */
 export type ApprovalOutcome =
-  | 'approved_once'
-  | 'approved_always'
-  | 'denied'
-  | 'expired'
-  | 'cancelled';
+  'approved_once' | 'approved_always' | 'denied' | 'expired' | 'cancelled';
 
 /** The part of a hold the RPC handler gives the signer: the link token and the eventual decision. */
 export interface HeldRequest {
@@ -182,7 +184,9 @@ export class ApprovalService implements OnModuleDestroy {
 
   /** The link a held request's client is sent, or undefined when PUBLIC_BASE_URL is not set. */
   authUrl(token: string): string | undefined {
-    return this.config.publicBaseUrl ? `${this.config.publicBaseUrl}/approvals/${token}` : undefined;
+    return this.config.publicBaseUrl
+      ? `${this.config.publicBaseUrl}/approvals/${token}`
+      : undefined;
   }
 
   /** The user's open holds, oldest first. */

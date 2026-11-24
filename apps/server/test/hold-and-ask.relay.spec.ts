@@ -143,17 +143,18 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
       requestPermissions: vi.fn(async () => undefined),
       touchActivity: vi.fn(async () => undefined),
       denyRequests: vi.fn(async () => undefined),
-      grantPermissions: vi.fn(async (_c: string, _u: string, perms: Array<{ method: string; kind?: number }>) => {
-        for (const p of perms) {
-          conn.permissions.push({ method: p.method, kind: p.kind ?? null, allowed: true });
-        }
-      }),
+      grantPermissions: vi.fn(
+        async (_c: string, _u: string, perms: Array<{ method: string; kind?: number }>) => {
+          for (const p of perms) {
+            conn.permissions.push({ method: p.method, kind: p.kind ?? null, allowed: true });
+          }
+        },
+      ),
     };
     const logSigningAction = vi.fn(async () => undefined);
-    const approvals = new ApprovalService(
-      { ttlMs: opts.ttlMs ?? 100_000, publicBaseUrl: BASE },
-      { publishUserActivity: vi.fn(async () => undefined) } as unknown as EventsService,
-    );
+    const approvals = new ApprovalService({ ttlMs: opts.ttlMs ?? 100_000, publicBaseUrl: BASE }, {
+      publishUserActivity: vi.fn(async () => undefined),
+    } as unknown as EventsService);
     const handler = new BunkerRpcHandler(
       connections as unknown as ConnectionsService,
       { logSigningAction } as unknown as LoggingService,
@@ -163,7 +164,10 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     );
     const svc = new BunkerService(
       handler,
-      { nsecKey: { findMany: async () => [] }, relayConfig: { findMany: async () => [] } } as unknown as PrismaService,
+      {
+        nsecKey: { findMany: async () => [] },
+        relayConfig: { findMany: async () => [] },
+      } as unknown as PrismaService,
       {} as unknown as EncryptionService,
       [],
       approvals,
@@ -175,7 +179,9 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
       approvals,
       connections as unknown as ConnectionsService,
     );
-    const asOwner = { user: { sub: USER } } as unknown as Parameters<ApprovalsController['list']>[0];
+    const asOwner = { user: { sub: USER } } as unknown as Parameters<
+      ApprovalsController['list']
+    >[0];
 
     // The client: nostr-tools' own NIP-46 signer, the one BIES uses.
     const authUrls: string[] = [];

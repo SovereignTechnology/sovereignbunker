@@ -95,7 +95,9 @@ describe('AppLayout: approvals badge and watch', () => {
     const w = mountLayout();
     await flushPromises();
     expect(w.get('[data-testid="approvals-badge"]').text()).toBe('3');
-    expect(w.get('[data-testid="approvals-pill"]').text()).toContain('3 requests are waiting for you');
+    expect(w.get('[data-testid="approvals-pill"]').text()).toContain(
+      '3 requests are waiting for you',
+    );
     w.unmount();
   });
 
@@ -105,7 +107,9 @@ describe('AppLayout: approvals badge and watch', () => {
     const w = mountLayout();
     await flushPromises();
     expect(w.get('[data-testid="approvals-badge"]').text()).toBe('1');
-    expect(w.get('[data-testid="approvals-pill"]').text()).toContain('1 request is waiting for you');
+    expect(w.get('[data-testid="approvals-pill"]').text()).toContain(
+      '1 request is waiting for you',
+    );
     w.unmount();
   });
 

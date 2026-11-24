@@ -1,11 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NotFoundException } from '@nestjs/common';
 import { APPROVAL_CONSTANTS } from '@bunker46/config';
-import {
-  ApprovalService,
-  previewSignEvent,
-  type OpenApprovalInput,
-} from './approval.service.js';
+import { ApprovalService, previewSignEvent, type OpenApprovalInput } from './approval.service.js';
 import type { EventsService } from '../events/events.service.js';
 
 const TTL = 100_000;
@@ -15,7 +11,9 @@ describe('ApprovalService', () => {
   let service: ApprovalService;
 
   const make = (publicBaseUrl: string | undefined = 'https://signer.example.test:50217') =>
-    new ApprovalService({ ttlMs: TTL, publicBaseUrl }, { publishUserActivity: publish } as unknown as EventsService);
+    new ApprovalService({ ttlMs: TTL, publicBaseUrl }, {
+      publishUserActivity: publish,
+    } as unknown as EventsService);
 
   const input = (over: Partial<OpenApprovalInput> = {}): OpenApprovalInput => ({
     userId: 'user-1',
@@ -149,9 +147,12 @@ describe('ApprovalService', () => {
 
       await expect(first.decision).resolves.toBe('approved_always');
       await expect(retry.decision).resolves.toBe('approved_always');
-      expect(service.list('user-1').map((a) => a.token).sort()).toEqual(
-        [otherKind.token, otherConn.token].sort(),
-      );
+      expect(
+        service
+          .list('user-1')
+          .map((a) => a.token)
+          .sort(),
+      ).toEqual([otherKind.token, otherConn.token].sort());
     });
 
     it('approve once settles only that request', () => {
@@ -217,7 +218,7 @@ describe('ApprovalService', () => {
   });
 
   describe('cancelling', () => {
-    it("ends every hold of one connection, as cancelled, and leaves the others", async () => {
+    it('ends every hold of one connection, as cancelled, and leaves the others', async () => {
       const a = service.open(input({ requestId: 'a' }))!;
       const b = service.open(input({ requestId: 'b' }))!;
       const other = service.open(input({ connectionId: 'conn-2' }))!;

@@ -83,7 +83,10 @@ describe('ConnectionsController', () => {
       ['a fractional kind', [{ method: 'sign_event', kind: 1.5 }]],
       ['a non-numeric kind', [{ method: 'sign_event', kind: '1' }]],
       ['a list that is not an array of objects', ['sign_event']],
-      ['more entries than any picker offers', Array.from({ length: 65 }, (_, i) => ({ method: 'sign_event', kind: i }))],
+      [
+        'more entries than any picker offers',
+        Array.from({ length: 65 }, (_, i) => ({ method: 'sign_event', kind: i })),
+      ],
       ['null', null],
     ])('rejects %s with 400 and creates nothing', async (_name, permissions) => {
       await expect(create({ permissions })).rejects.toThrow(BadRequestException);
@@ -116,10 +119,13 @@ describe('ConnectionsController', () => {
       );
     });
 
-    it.each(['ask', 'ALLOW', 1, null, {}])('rejects %j with 400 and creates nothing', async (approvalMode) => {
-      await expect(create({ approvalMode })).rejects.toThrow(BadRequestException);
-      expect(service['createConnection']).not.toHaveBeenCalled();
-    });
+    it.each(['ask', 'ALLOW', 1, null, {}])(
+      'rejects %j with 400 and creates nothing',
+      async (approvalMode) => {
+        await expect(create({ approvalMode })).rejects.toThrow(BadRequestException);
+        expect(service['createConnection']).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('create: ownership', () => {
@@ -173,7 +179,7 @@ describe('ConnectionsController', () => {
       expect(approvals.cancelForConnection).not.toHaveBeenCalled();
     });
 
-    it("a foreign connection is not revoked and its holds are not cancelled", async () => {
+    it('a foreign connection is not revoked and its holds are not cancelled', async () => {
       service['getConnection']!.mockRejectedValue(new NotFoundException('Connection not found'));
       await expect(controller.updateStatus(req, 'conn-1', { status: 'REVOKED' })).rejects.toThrow(
         NotFoundException,
