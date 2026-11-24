@@ -236,6 +236,28 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
       expect(kept[0]!.allowed).toBe(true);
     });
 
+    it('refuses to grant on a revoked connection, and stores nothing', async () => {
+      const { user, conn } = await seedConnection();
+      await prisma.bunkerConnection.update({ where: { id: conn.id }, data: { status: 'REVOKED' } });
+      await expect(
+        service.grantPermissions(conn.id, user.id, [{ method: 'sign_event', kind: 27235 }]),
+      ).rejects.toThrow();
+      expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(0);
+    });
+
+    it('a later grant for the same kind adds no second row even when two approvals race', async () => {
+      const { user, conn } = await seedConnection();
+      await Promise.allSettled([
+        service.grantPermissions(conn.id, user.id, [{ method: 'sign_event', kind: 27235 }]),
+        service.grantPermissions(conn.id, user.id, [{ method: 'sign_event', kind: 27235 }]),
+      ]);
+      expect(
+        await prisma.connectionPermission.count({
+          where: { connectionId: conn.id, method: 'sign_event', kind: 27235 },
+        }),
+      ).toBe(1);
+    });
+
     it("never grants on someone else's connection", async () => {
       const { conn } = await seedConnection();
       const { user: stranger } = await seedKey();
@@ -243,6 +265,34 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
         service.grantPermissions(conn.id, stranger.id, [{ method: 'sign_event', kind: 27235 }]),
       ).rejects.toThrow();
       expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(0);
+    });
+  });
+
+  describe('pending permission requests', () => {
+    it('keeps the newest 50 per connection: a client probing kinds cannot grow the table without end', async () => {
+      const { conn } = await seedConnection();
+      for (let kind = 1; kind <= 55; kind++) {
+        await service.requestPermissions(conn.id, [{ method: 'sign_event', kind }]);
+      }
+      const pending = await prisma.connectionPermission.findMany({
+        where: { connectionId: conn.id, allowed: false },
+      });
+      expect(pending).toHaveLength(50);
+      const kinds = pending.map((p) => p.kind).sort((a, b) => a! - b!);
+      // The five oldest are the ones dropped.
+      expect(kinds[0]).toBe(6);
+      expect(kinds[49]).toBe(55);
+    });
+
+    it('never drops a granted row to make room', async () => {
+      const { user, conn } = await seedConnection();
+      await service.grantPermissions(conn.id, user.id, [{ method: 'sign_event', kind: 27235 }]);
+      for (let kind = 1; kind <= 55; kind++) {
+        await service.requestPermissions(conn.id, [{ method: 'sign_event', kind }]);
+      }
+      expect(await service.getPermissions(conn.id)).toEqual([
+        { method: 'sign_event', kind: 27235 },
+      ]);
     });
   });
 
@@ -264,6 +314,18 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
       const conn = await service.createConnection(user.id, nsecKey.id, 'client-y', { name: 'Y' });
       const granted = await service.getPermissions(conn.id);
       expect(granted.map((p) => p.kind).sort()).toEqual([0, 1, 3, 4, 7]);
+    });
+
+    it('a seed the database cannot store leaves no connection behind (one transaction)', async () => {
+      const { user, nsecKey } = await seedKey();
+      await expect(
+        service.createConnection(user.id, nsecKey.id, 'client-orphan', { name: 'Orphan' }, [
+          { method: 'sign_event', kind: 3_000_000_000 },
+        ]),
+      ).rejects.toThrow();
+      expect(
+        await prisma.bunkerConnection.count({ where: { clientPubkey: 'client-orphan' } }),
+      ).toBe(0);
     });
 
     it('a repeated entry in the chosen list is stored once', async () => {

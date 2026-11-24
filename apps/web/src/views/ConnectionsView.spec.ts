@@ -15,6 +15,7 @@ vi.mock('@/composables/useActivityStream', () => ({ useActivityStream: () => und
 vi.mock('qrcode', () => ({ toDataURL: vi.fn().mockResolvedValue('data:image/png;base64,AAAA') }));
 
 import ConnectionsView from './ConnectionsView.vue';
+import { $approvalsCanAsk } from '@/stores/approvals';
 
 const CLIENT = 'b'.repeat(64);
 const KEY = {
@@ -65,24 +66,53 @@ describe('ConnectionsView: importing a nostrconnect:// URI', () => {
   beforeEach(() => {
     apiGet.mockReset();
     apiPost.mockReset();
+    $approvalsCanAsk.set(true);
   });
 
-  it('pre-selects what the URI asked for, and shows it before anything is granted', async () => {
+  it('pre-selects the kinds the URI asked for, and shows it before anything is granted', async () => {
     const w = await mountView();
-    await openImport(w, 'sign_event:1,sign_event:27235,nip44_decrypt');
-    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:27235', 'nip44_decrypt']);
+    await openImport(w, 'sign_event:1,sign_event:27235');
+    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:27235']);
+  });
+
+  it('does not tick what a link asks for beyond kinds, but says it asked', async () => {
+    const w = await mountView();
+    await openImport(w, 'sign_event:1,sign_event,nip44_decrypt');
+    expect(chips(w)).toEqual(['sign_event:1']);
+    const note = w.get('[data-testid="uri-flagged"]').text();
+    expect(note).toContain('sign_event');
+    expect(note).toContain('nip44_decrypt');
+  });
+
+  it('has no note when everything the link asked for is ticked', async () => {
+    const w = await mountView();
+    await openImport(w, 'sign_event:1');
+    expect(w.find('[data-testid="uri-flagged"]').exists()).toBe(false);
+  });
+
+  it('without a PUBLIC_BASE_URL on the server, asking is switched off and says why', async () => {
+    $approvalsCanAsk.set(false);
+    const w = await mountView();
+    await openImport(w, 'sign_event:1');
+    const box = w.get('[data-testid="ask-checkbox"]');
+    expect((box.element as HTMLInputElement).checked).toBe(false);
+    expect(box.attributes('disabled')).toBeDefined();
+    expect(w.get('[data-testid="ask-unavailable"]').text()).toContain('PUBLIC_BASE_URL');
+    await button(w, 'Create Connection').trigger('click');
+    await flushPromises();
+    expect((connectionsPost()![1] as Record<string, unknown>)['approvalMode']).toBe('DENY');
   });
 
   it('grants exactly what the operator left in the picker, after editing it', async () => {
     const w = await mountView();
-    await openImport(w, 'sign_event:1,sign_event:27235,nip44_decrypt');
+    await openImport(w, 'sign_event:1,sign_event:27235,sign_event:7');
 
-    // The operator drops the decrypt permission the app asked for.
-    const decrypt = w
+    // The operator drops the login the app asked for.
+    const login = w
       .findAll('[data-testid="perm-chip"]')
-      .find((c) => c.text().includes('nip44_decrypt'))!;
-    await decrypt.get('button').trigger('click');
-    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:27235']);
+      .find((c) => c.text().includes('sign_event:27235'))!;
+    await login.get('button').trigger('click');
+    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:7']);
 
     await button(w, 'Create Connection').trigger('click');
     await flushPromises();
@@ -90,7 +120,7 @@ describe('ConnectionsView: importing a nostrconnect:// URI', () => {
     const [, body] = connectionsPost()! as [string, Record<string, unknown>];
     expect(body['permissions']).toEqual([
       { method: 'sign_event', kind: 1 },
-      { method: 'sign_event', kind: 27235 },
+      { method: 'sign_event', kind: 7 },
     ]);
   });
 

@@ -1,13 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_CONNECTION_PERMISSIONS } from '@bunker46/shared-types';
-import { permissionsFromUri } from './permissions.js';
+import { permissionsFromUri, splitUriPermissions } from './permissions.js';
 
 describe('permissionsFromUri', () => {
-  it('pre-selects what the app asked for', () => {
-    expect(permissionsFromUri('sign_event:1,sign_event:27235,nip44_decrypt')).toEqual([
+  it('pre-selects the kinds the app asked for', () => {
+    expect(permissionsFromUri('sign_event:1,sign_event:27235')).toEqual([
       { method: 'sign_event', kind: 1 },
       { method: 'sign_event', kind: 27235 },
-      { method: 'nip44_decrypt' },
+    ]);
+  });
+
+  it('does NOT pre-select a decrypt, an encrypt or sign_event for every kind: a link can ask for anything', () => {
+    expect(permissionsFromUri('sign_event:1,sign_event,nip44_decrypt,nip04_encrypt')).toEqual([
+      { method: 'sign_event', kind: 1 },
     ]);
   });
 
@@ -36,15 +41,37 @@ describe('permissionsFromUri', () => {
     ]);
   });
 
-  it('keeps a method-level request method-level (all kinds), as asked', () => {
-    expect(permissionsFromUri('sign_event')).toEqual([{ method: 'sign_event' }]);
+  it('a URI that asks only for things that are not pre-selected starts from the defaults', () => {
+    expect(permissionsFromUri('sign_event,nip44_decrypt')).toEqual([
+      ...DEFAULT_CONNECTION_PERMISSIONS,
+    ]);
   });
 
   it('lists each permission once', () => {
     expect(permissionsFromUri('sign_event:1,sign_event:1,nip44_decrypt,nip44_decrypt')).toEqual([
       { method: 'sign_event', kind: 1 },
-      { method: 'nip44_decrypt' },
     ]);
+  });
+
+  describe('splitUriPermissions', () => {
+    it('ticks the kind-scoped entries and flags the rest, each once, for the operator to see', () => {
+      expect(
+        splitUriPermissions('sign_event:1,sign_event,nip44_decrypt,sign_event:27235,nip44_decrypt'),
+      ).toEqual({
+        picked: [
+          { method: 'sign_event', kind: 1 },
+          { method: 'sign_event', kind: 27235 },
+        ],
+        flagged: [{ method: 'sign_event' }, { method: 'nip44_decrypt' }],
+      });
+    });
+
+    it('flags nothing when nothing was asked, and ticks the defaults', () => {
+      expect(splitUriPermissions(null)).toEqual({
+        picked: [...DEFAULT_CONNECTION_PERMISSIONS],
+        flagged: [],
+      });
+    });
   });
 
   it('never returns more than the server accepts', () => {

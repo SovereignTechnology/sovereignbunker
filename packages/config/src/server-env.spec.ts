@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { APPROVAL_CONSTANTS, NOSTR_CONSTANTS } from './constants.js';
-import { serverEnvSchema } from './server-env.js';
+import { deploymentWarnings, serverEnvSchema } from './server-env.js';
 
 describe('serverEnvSchema', () => {
   const baseEnv = {
@@ -204,10 +204,11 @@ describe('serverEnvSchema', () => {
         expect(result.data.PUBLIC_BASE_URL).toBe('https://signer.example.test:50217');
     });
 
-    it('accepts a plain http origin with a port and an IPv6 host', () => {
+    it('accepts plain http only for this machine, and https anywhere', () => {
       for (const value of [
         'http://localhost:5173',
-        'http://100.64.0.3:8080',
+        'http://127.0.0.1:8080',
+        'http://[::1]:8080',
         'https://[::1]:8443',
       ]) {
         const result = parse({ PUBLIC_BASE_URL: value });
@@ -231,6 +232,12 @@ describe('serverEnvSchema', () => {
       'https://example.test?x=1',
       'https://example.test#frag',
       'https://@example.test',
+      // The link carries the operator to a login page: plain http would let anyone on the path
+      // swap it, so http is for this machine only.
+      'http://example.test',
+      'http://100.64.0.3:8080',
+      'http://localhost.example.test',
+      'http://localhost@evil.example',
       'not a url',
     ])('rejects %s', (value) => {
       expect(parse({ PUBLIC_BASE_URL: value }).success).toBe(false);
@@ -265,5 +272,23 @@ describe('serverEnvSchema', () => {
     it.each(['1000', '250000', '-5', 'abc', '1.5'])('rejects %s', (value) => {
       expect(parse({ ASK_APPROVAL_TTL_MS: value }).success).toBe(false);
     });
+  });
+});
+
+describe('deploymentWarnings', () => {
+  it('warns when PUBLIC_BASE_URL is set but TRUST_PROXY is not: behind a proxy every caller shares one rate-limit bucket', () => {
+    const warnings = deploymentWarnings({
+      PUBLIC_BASE_URL: 'https://signer.example.test',
+      TRUST_PROXY: false,
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('TRUST_PROXY');
+  });
+
+  it.each([
+    [{ PUBLIC_BASE_URL: 'https://signer.example.test', TRUST_PROXY: true }],
+    [{ PUBLIC_BASE_URL: undefined, TRUST_PROXY: false }],
+  ])('says nothing for %j', (env) => {
+    expect(deploymentWarnings(env)).toEqual([]);
   });
 });

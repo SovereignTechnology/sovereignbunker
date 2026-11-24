@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { NotFoundException, ForbiddenException } from '@nestjs/common';
+import { ConflictException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { ConnectionsService } from './connections.service.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import type { EncryptionService } from '../common/crypto/encryption.service.js';
@@ -39,6 +39,10 @@ describe('ConnectionsService', () => {
         findMany: vi.fn().mockResolvedValue([]),
       },
     };
+    // An interactive transaction: the callback gets a client, here the same mocks.
+    (prisma as unknown as { $transaction: unknown }).$transaction = vi.fn(
+      async (fn: (tx: unknown) => unknown) => fn(prisma),
+    );
     encryption = {
       encrypt: vi.fn().mockReturnValue('encrypted'),
       decrypt: vi.fn().mockReturnValue('nsec-hex'),
@@ -192,6 +196,35 @@ describe('ConnectionsService', () => {
         data: Array<{ method: string; kind: number | null }>;
       };
       expect(seedArg.data).toHaveLength(2);
+    });
+
+    it('creates the connection and seeds its permissions in ONE transaction, so a seed that fails leaves no orphan row behind', async () => {
+      vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
+        id: 'key-1',
+        userId: 'user-1',
+      } as never);
+      const tx = {
+        bunkerConnection: { create: vi.fn().mockResolvedValue({ id: 'conn-9' }) },
+        connectionPermission: { createMany: vi.fn().mockResolvedValue({ count: 1 }) },
+      };
+      const run = vi.mocked(
+        (prisma as unknown as { $transaction: (fn: (t: unknown) => unknown) => unknown })
+          .$transaction,
+      );
+      run.mockImplementationOnce(async (fn) => fn(tx));
+
+      await service.createConnection('user-1', 'key-1', 'client-pub', { name: 'App' }, [
+        { method: 'sign_event', kind: 1 },
+      ]);
+
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(tx.bunkerConnection.create).toHaveBeenCalledTimes(1);
+      expect(tx.connectionPermission.createMany).toHaveBeenCalledWith({
+        data: [{ connectionId: 'conn-9', method: 'sign_event', kind: 1, allowed: true }],
+      });
+      // Neither write went around the transaction.
+      expect(prisma.bunkerConnection?.create).not.toHaveBeenCalled();
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
     });
 
     it('defaults the approval mode to DENY, so existing behaviour is the default', async () => {
@@ -390,6 +423,41 @@ describe('ConnectionsService', () => {
       });
     });
 
+    it('keeps at most 50 pending rows per connection: the oldest are dropped to make room', async () => {
+      const pending = Array.from({ length: 50 }, (_, i) => ({
+        id: `p${String(i).padStart(2, '0')}`,
+        method: 'sign_event',
+        kind: 1000 + i,
+        allowed: false,
+      }));
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue(pending as never);
+      await service.requestPermissions('conn-1', [
+        { method: 'sign_event', kind: 9000 },
+        { method: 'sign_event', kind: 9001 },
+      ]);
+      expect(prisma.connectionPermission?.deleteMany).toHaveBeenCalledWith({
+        where: { id: { in: ['p00', 'p01'] } },
+      });
+      expect(prisma.connectionPermission?.createMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('never files more than 50 new pending rows from one request', async () => {
+      const many = Array.from({ length: 64 }, (_, i) => ({
+        method: 'sign_event' as const,
+        kind: i,
+      }));
+      await service.requestPermissions('conn-1', many);
+      const arg = vi.mocked(prisma.connectionPermission!.createMany!).mock.calls[0]![0] as {
+        data: unknown[];
+      };
+      expect(arg.data).toHaveLength(50);
+    });
+
+    it('does not touch the table when there is room', async () => {
+      await service.requestPermissions('conn-1', [{ method: 'sign_event', kind: 7 }]);
+      expect(prisma.connectionPermission?.deleteMany).not.toHaveBeenCalled();
+    });
+
     it('never files a request a grant already covers', async () => {
       vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
         { method: 'sign_event', kind: null, allowed: true },
@@ -408,6 +476,19 @@ describe('ConnectionsService', () => {
       await expect(
         service.grantPermissions('conn-1', 'user-1', [{ method: 'sign_event', kind: 27235 }]),
       ).rejects.toThrow(NotFoundException);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+      expect(prisma.connectionPermission?.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('refuses to grant on a REVOKED connection: a late "always allow" must not outlive the revoke', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'user-1',
+        status: 'REVOKED',
+      } as never);
+      await expect(
+        service.grantPermissions('conn-1', 'user-1', [{ method: 'sign_event', kind: 27235 }]),
+      ).rejects.toThrow(ConflictException);
       expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
       expect(prisma.connectionPermission?.deleteMany).not.toHaveBeenCalled();
     });

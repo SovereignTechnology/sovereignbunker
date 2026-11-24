@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NotFoundException } from '@nestjs/common';
 import { APPROVAL_CONSTANTS } from '@bunker46/config';
-import { ApprovalService, previewSignEvent, type OpenApprovalInput } from './approval.service.js';
+import {
+  ApprovalService,
+  previewRequest,
+  previewSignEvent,
+  type OpenApprovalInput,
+} from './approval.service.js';
 import type { EventsService } from '../events/events.service.js';
 
 const TTL = 100_000;
@@ -22,6 +27,7 @@ describe('ApprovalService', () => {
     connectionName: 'BIES',
     clientPubkey: 'c'.repeat(64),
     requestId: 'req-1',
+    fingerprint: 'fp-1',
     permission: { method: 'sign_event', kind: 27235 },
     ...over,
   });
@@ -71,6 +77,59 @@ describe('ApprovalService', () => {
     });
   });
 
+  describe('canAsk', () => {
+    it('is true with a PUBLIC_BASE_URL and false without: nothing can be asked without a link to send', () => {
+      expect(make().canAsk).toBe(true);
+      expect(make(null).canAsk).toBe(false);
+    });
+  });
+
+  describe('one hold per request id', () => {
+    it('a second event carrying the same request id shares the first hold, and is told so', async () => {
+      const first = service.open(input())!;
+      const second = service.open(input())!;
+      expect(second.token).toBe(first.token);
+      expect(second.shared).toBe(true);
+      expect(first.shared).toBeFalsy();
+      expect(service.list('user-1')).toHaveLength(1);
+      service.resolve(first.token, 'user-1', 'denied');
+      await expect(second.decision).resolves.toBe('denied');
+    });
+
+    it('a shared hold takes no extra slot under any cap', () => {
+      for (let i = 0; i < APPROVAL_CONSTANTS.MAX_HOLDS_PER_CONNECTION - 1; i++) {
+        service.open(input({ requestId: `r${i}` }));
+      }
+      expect(service.open(input({ requestId: 'last' }))).toBeDefined();
+      // The connection is full, yet a retry of a request that is held still shares it.
+      expect(service.open(input({ requestId: 'last' }))?.shared).toBe(true);
+    });
+
+    it('the same id on another connection is a different request', () => {
+      const a = service.open(input())!;
+      const b = service.open(input({ connectionId: 'conn-2' }))!;
+      expect(b.token).not.toBe(a.token);
+      expect(b.shared).toBeFalsy();
+    });
+
+    it('the same id for something else is refused, never merged: approving one must not sign the other', () => {
+      service.open(input({ fingerprint: 'event-A' }));
+      expect(service.open(input({ fingerprint: 'event-B' }))).toBeUndefined();
+      expect(
+        service.open(input({ permission: { method: 'sign_event', kind: 1 } })),
+      ).toBeUndefined();
+      expect(service.list('user-1')).toHaveLength(1);
+    });
+
+    it('once the first hold has ended, the same id is held afresh', () => {
+      const first = service.open(input())!;
+      service.resolve(first.token, 'user-1', 'denied');
+      const again = service.open(input())!;
+      expect(again.token).not.toBe(first.token);
+      expect(again.shared).toBeFalsy();
+    });
+  });
+
   describe('listing and ownership', () => {
     it("lists only the user's own holds, oldest first", () => {
       service.open(input({ requestId: 'a' }));
@@ -87,7 +146,7 @@ describe('ApprovalService', () => {
 
     it('describes a hold without exposing anything but what the operator needs', () => {
       const { token } = service.open(
-        input({ preview: { kind: 27235, content: 'login', tagNames: ['u'] } }),
+        input({ preview: { kind: 27235, content: 'login', tags: [{ name: 'u', values: ['x'] }] } }),
       )!;
       const dto = service.get(token, 'user-1');
       expect(Object.keys(dto).sort()).toEqual(
@@ -208,13 +267,33 @@ describe('ApprovalService', () => {
       expect(service.open(input({ requestId: 'fits-now' }))).toBeDefined();
     });
 
+    it('refuses a hold beyond the per-user cap of 50, below the global one; other users are unaffected', () => {
+      // 5 connections x 10 holds = 50 for one user.
+      for (let c = 0; c < 5; c++) {
+        for (let i = 0; i < APPROVAL_CONSTANTS.MAX_HOLDS_PER_CONNECTION; i++) {
+          expect(
+            service.open(input({ connectionId: `conn-${c}`, requestId: `r${c}-${i}` })),
+          ).toBeDefined();
+        }
+      }
+      expect(service.open(input({ connectionId: 'conn-9', requestId: 'over' }))).toBeUndefined();
+      expect(
+        service.open(input({ userId: 'user-2', connectionId: 'conn-x', requestId: 'o' })),
+      ).toBeDefined();
+      expect(APPROVAL_CONSTANTS.MAX_HOLDS_GLOBAL).toBeGreaterThan(50);
+    });
+
     it('refuses a hold beyond the global cap', () => {
       for (let i = 0; i < APPROVAL_CONSTANTS.MAX_HOLDS_GLOBAL; i++) {
         expect(
-          service.open(input({ connectionId: `conn-${i}`, requestId: `r${i}` })),
+          service.open(
+            input({ userId: `user-${i}`, connectionId: `conn-${i}`, requestId: `r${i}` }),
+          ),
         ).toBeDefined();
       }
-      expect(service.open(input({ connectionId: 'conn-next' }))).toBeUndefined();
+      expect(
+        service.open(input({ userId: 'user-next', connectionId: 'conn-next', requestId: 'n' })),
+      ).toBeUndefined();
     });
   });
 
@@ -258,78 +337,170 @@ describe('ApprovalService', () => {
 });
 
 describe('previewSignEvent', () => {
-  it('shows the kind, the content and the tag NAMES only', () => {
+  const event = (over: Record<string, unknown>) =>
+    JSON.stringify({ kind: 1, content: '', ...over });
+  const MAX = APPROVAL_CONSTANTS.PREVIEW_CONTENT_MAX;
+
+  it('shows the kind, the content and, for every tag, its name and its first values', () => {
     const preview = previewSignEvent(
-      JSON.stringify({
-        kind: 27235,
+      event({
+        kind: 1,
         content: 'hello',
-        tags: [
-          ['u', 'https://app.example/secret-path?token=abc'],
-          ['method', 'POST'],
-          ['u', 'again'],
-        ],
+        tags: [['e', 'abc', 'wss://relay.example', 'root', 'a fourth value'], ['p', 'def'], ['t']],
       }),
     );
     expect(preview).toEqual({
-      kind: 27235,
+      kind: 1,
       content: 'hello',
       contentTruncated: false,
-      tagNames: ['u', 'method'],
+      contentLength: 5,
+      tagCount: 3,
+      tags: [
+        { name: 'e', values: ['abc', 'wss://relay.example', 'root'] },
+        { name: 'p', values: ['def'] },
+        { name: 't', values: [] },
+      ],
     });
-    expect(JSON.stringify(preview)).not.toContain('secret-path');
   });
 
-  it('cuts long content and says so', () => {
-    const max = APPROVAL_CONSTANTS.PREVIEW_CONTENT_MAX;
-    const preview = previewSignEvent(JSON.stringify({ kind: 1, content: 'x'.repeat(max + 50) }))!;
-    expect(preview.content).toHaveLength(max);
+  it('keeps two tags of the same name apart: their values are the difference', () => {
+    const preview = previewSignEvent(
+      event({
+        tags: [
+          ['u', 'https://app.example/login'],
+          ['u', 'https://app.example/account/delete'],
+        ],
+      }),
+    )!;
+    expect(preview.tags?.map((t) => t.values[0])).toEqual([
+      'https://app.example/login',
+      'https://app.example/account/delete',
+    ]);
+  });
+
+  it('cuts every value to 100 characters, and a tag to 3 values', () => {
+    const preview = previewSignEvent(event({ tags: [['x', 'v'.repeat(500), 'b', 'c', 'd']] }))!;
+    expect(preview.tags![0]!.values).toHaveLength(3);
+    expect(preview.tags![0]!.values[0]).toHaveLength(100);
+  });
+
+  it('cleans tag values like content: controls, bidi and invisible characters never reach the view', () => {
+    const preview = previewSignEvent(
+      event({ tags: [['u', 'https://good.example/‮evil\u0000​x­y']] }),
+    )!;
+    expect(preview.tags![0]!.values[0]).toBe('https://good.example/?evil??x?y');
+  });
+
+  it('cuts content, tag names and values by code point, never through a surrogate pair', () => {
+    const preview = previewSignEvent(
+      event({ content: '😀'.repeat(MAX + 5), tags: [['😀'.repeat(20), '😀'.repeat(150)]] }),
+    )!;
+    expect(preview.content).toBe('😀'.repeat(MAX));
+    expect(preview.tags![0]!.name).toBe('😀'.repeat(16));
+    expect(preview.tags![0]!.values[0]).toBe('😀'.repeat(100));
+  });
+
+  it('cuts long content and says how long the whole of it was', () => {
+    const preview = previewSignEvent(event({ content: 'x'.repeat(MAX + 50) }))!;
+    expect(preview.content).toHaveLength(MAX);
     expect(preview.contentTruncated).toBe(true);
+    expect(preview.contentLength).toBe(MAX + 50);
   });
 
   it('removes control characters so the content cannot garble or spoof the view', () => {
-    const preview = previewSignEvent(
-      JSON.stringify({ kind: 1, content: 'a\u0000b\u001b[31mc\nd\u007fe' }),
-    )!;
+    const preview = previewSignEvent(event({ content: 'a\u0000b\u001b[31mc\nd\u007fe' }))!;
     // eslint-disable-next-line no-control-regex
     expect(preview.content).not.toMatch(/[\u0000-\u001f\u007f]/);
     expect(preview.content).toBe('a b [31mc d e');
   });
 
   it('removes characters that reorder or hide text: bidi overrides, zero-width, C1 and line separators', () => {
-    const evil = 'pay\u202Eevil\u202C\u2066x\u2069\u200Bz\u200F\u0085\u2028\u2029\u2060\uFEFFend';
-    const preview = previewSignEvent(JSON.stringify({ kind: 1, content: evil }))!;
+    const evil = 'pay‮evil‬⁦x⁩​z‏\u0085  ⁠﻿end';
+    const preview = previewSignEvent(event({ content: evil }))!;
     expect(preview.content).toBe('pay evil  x  z      end');
-    expect(preview.content).not.toMatch(
-      /[\u0080-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/,
-    );
+  });
+
+  it('also removes the soft hyphen, Arabic letter mark, Hangul fillers, variation selectors and tag characters', () => {
+    const evil = 'a­b؜cᅟdᅠeㅤfﾠg️h\u{E0041}i';
+    const preview = previewSignEvent(event({ content: evil }))!;
+    expect(preview.content).toBe('a b c d e f g h i');
   });
 
   it('keeps ordinary non-ASCII text intact', () => {
-    const preview = previewSignEvent(JSON.stringify({ kind: 1, content: 'café 日本語 🚀' }))!;
+    const preview = previewSignEvent(event({ content: 'café 日本語 🚀' }))!;
     expect(preview.content).toBe('café 日本語 🚀');
   });
 
   it('cleans tag names the same way', () => {
-    const preview = previewSignEvent(
-      JSON.stringify({ kind: 1, content: '', tags: [['p\u202Eq', 'v']] }),
-    )!;
-    expect(preview.tagNames).toEqual(['p?q']);
+    const preview = previewSignEvent(event({ tags: [['p‮q', 'v']] }))!;
+    expect(preview.tags![0]!.name).toBe('p?q');
   });
 
-  it('bounds the tag names, in count and length', () => {
+  it('bounds the tags, in count and length, and still says how many there were', () => {
     const tags = Array.from({ length: 100 }, (_, i) => [`tag-${i}-${'z'.repeat(40)}`, 'v']);
-    const preview = previewSignEvent(JSON.stringify({ kind: 1, content: '', tags }))!;
-    expect(preview.tagNames).toHaveLength(APPROVAL_CONSTANTS.PREVIEW_TAG_NAMES_MAX);
-    expect(Math.max(...preview.tagNames!.map((n) => n.length))).toBeLessThanOrEqual(16);
+    const preview = previewSignEvent(event({ tags }))!;
+    expect(preview.tags).toHaveLength(APPROVAL_CONSTANTS.PREVIEW_TAG_NAMES_MAX);
+    expect(preview.tagCount).toBe(100);
+    expect(Math.max(...preview.tags!.map((t) => t.name.length))).toBeLessThanOrEqual(16);
   });
 
-  it('ignores malformed tags and a kind that is not a whole non-negative number', () => {
+  it('ignores malformed tags and a kind that is not a whole number from 0 to 65535', () => {
     const preview = previewSignEvent(
       JSON.stringify({ kind: -3, content: 5, tags: ['x', [], [7], ['ok']] }),
     )!;
     expect(preview.kind).toBeUndefined();
     expect(preview.content).toBeUndefined();
-    expect(preview.tagNames).toEqual(['ok']);
+    expect(preview.tags).toEqual([{ name: 'ok', values: [] }]);
+  });
+
+  it.each([65536, 3_000_000_000, 1.5])('shows no kind for %s: it could never be signed', (kind) => {
+    expect(previewSignEvent(event({ kind }))!.kind).toBeUndefined();
+  });
+
+  it('keeps kind 65535, the last one there is', () => {
+    expect(previewSignEvent(event({ kind: 65535 }))!.kind).toBe(65535);
+  });
+
+  describe('kind 27235 (HTTP auth, also what confirms deleting an account)', () => {
+    const PAYLOAD = 'ab'.repeat(32);
+    const login = (u: string, extra: string[][] = []) =>
+      previewSignEvent(
+        event({
+          kind: 27235,
+          tags: [['u', u], ['method', 'DELETE'], ['payload', PAYLOAD], ...extra],
+        }),
+      )!;
+
+    it('puts the host and path of u, the method and the payload where they cannot be missed', () => {
+      expect(login('https://shop.example/api/account?confirm=1').httpAuth).toEqual({
+        host: 'shop.example',
+        path: '/api/account?confirm=1',
+        method: 'DELETE',
+        payload: PAYLOAD,
+      });
+    });
+
+    it('shows the real host: user info before the @ does not pass for it', () => {
+      expect(login('https://trusted.example@evil.example:8443/x').httpAuth?.host).toBe(
+        'evil.example:8443',
+      );
+    });
+
+    it('shows a look-alike host in its punycode form', () => {
+      expect(login('https://аpp.example/').httpAuth?.host).toMatch(/^xn--/);
+    });
+
+    it('a u that is not a URL is shown as it is, cleaned, and gives no host', () => {
+      const auth = login('not a url‮')!.httpAuth!;
+      expect(auth.host).toBeUndefined();
+      expect(auth.url).toBe('not a url?');
+    });
+
+    it('only for kind 27235', () => {
+      expect(
+        previewSignEvent(event({ kind: 1, tags: [['u', 'https://x.example/']] }))!.httpAuth,
+      ).toBeUndefined();
+    });
   });
 
   it.each([undefined, '', 'not json', 'null', '42', '"str"'])(
@@ -338,4 +509,47 @@ describe('previewSignEvent', () => {
       expect(previewSignEvent(raw)).toBeUndefined();
     },
   );
+});
+
+describe('previewRequest', () => {
+  const PEER = 'ab'.repeat(32);
+
+  it('previews a sign_event request as its event', () => {
+    expect(
+      previewRequest('sign_event', [JSON.stringify({ kind: 1, content: 'hi' })]),
+    ).toMatchObject({ kind: 1, content: 'hi' });
+  });
+
+  it.each(['nip04_encrypt', 'nip44_encrypt'])(
+    '%s: the peer and the plaintext, cleaned and cut, with its length',
+    (method) => {
+      const preview = previewRequest(method, [PEER, 'secret‮plan']);
+      expect(preview).toEqual({
+        peer: PEER,
+        content: 'secret plan',
+        contentTruncated: false,
+        contentLength: 11,
+      });
+    },
+  );
+
+  it.each(['nip04_decrypt', 'nip44_decrypt'])(
+    '%s: the peer and the ciphertext length, never the ciphertext itself',
+    (method) => {
+      const ciphertext = 'x'.repeat(300) + '?iv=abc';
+      const preview = previewRequest(method, [PEER, ciphertext]);
+      expect(preview).toEqual({ peer: PEER, ciphertextLength: ciphertext.length });
+      expect(JSON.stringify(preview)).not.toContain('xxxx');
+    },
+  );
+
+  it('cleans and bounds a peer value that is not a pubkey', () => {
+    const preview = previewRequest('nip44_decrypt', ['‮' + 'p'.repeat(200), 'c'])!;
+    expect(preview.peer).toHaveLength(64);
+    expect(preview.peer).not.toContain('‮');
+  });
+
+  it.each(['ping', 'connect', 'get_public_key', 'switch_relays'])('has none for %s', (method) => {
+    expect(previewRequest(method, [])).toBeUndefined();
+  });
 });

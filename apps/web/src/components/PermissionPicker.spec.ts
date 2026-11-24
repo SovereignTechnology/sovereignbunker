@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { mount } from '@vue/test-utils';
 import { defineComponent, ref, h } from 'vue';
 import type { PermissionDescriptor } from '@bunker46/shared-types';
 import PermissionPicker from './PermissionPicker.vue';
+import { $approvalsCanAsk } from '@/stores/approvals';
 
 /** The picker with real v-model state around it, as a form uses it. */
 function mountPicker(initial: PermissionDescriptor[], ask = false) {
@@ -163,6 +164,34 @@ describe('PermissionPicker', () => {
       expect((box.element as HTMLInputElement).checked).toBe(false);
       await box.setValue(true);
       expect(ask.value).toBe(true);
+    });
+  });
+
+  describe('when the server cannot ask (no PUBLIC_BASE_URL)', () => {
+    afterEach(() => $approvalsCanAsk.set(true));
+
+    it('unticks asking, disables it, and says why', async () => {
+      $approvalsCanAsk.set(false);
+      const { w, ask } = mountPicker([], true);
+      await w.vm.$nextTick();
+      expect(ask.value).toBe(false);
+      const box = w.get('[data-testid="ask-checkbox"]');
+      expect(box.attributes('disabled')).toBeDefined();
+      expect(w.get('[data-testid="ask-unavailable"]').text()).toContain('PUBLIC_BASE_URL');
+    });
+
+    it('does not offer "ask each time" for the login either', async () => {
+      $approvalsCanAsk.set(false);
+      const { w, ask } = mountPicker([], false);
+      await w.vm.$nextTick();
+      expect(w.get('[data-testid="login-ask"]').attributes('disabled')).toBeDefined();
+      expect(ask.value).toBe(false);
+    });
+
+    it('leaves asking alone when the server can ask', () => {
+      const { w } = mountPicker([], true);
+      expect(w.find('[data-testid="ask-unavailable"]').exists()).toBe(false);
+      expect(w.get('[data-testid="ask-checkbox"]').attributes('disabled')).toBeUndefined();
     });
   });
 });

@@ -29,6 +29,7 @@ describe('ApprovalsController', () => {
       connectionName: 'BIES',
       clientPubkey: 'c'.repeat(64),
       requestId: over.requestId ?? 'req-1',
+      fingerprint: 'fp',
       permission: { method: 'sign_event', kind: over.kind ?? 27235 },
     })!;
 
@@ -59,22 +60,28 @@ describe('ApprovalsController', () => {
       expect(guards).toEqual(expect.arrayContaining([JwtAuthGuard, TotpVerifiedGuard]));
     });
 
-    it.each(['list', 'get', 'approve', 'deny'] as const)(
-      'rate-limits %s on both throttlers',
+    it.each(['get', 'approve', 'deny'] as const)('rate-limits %s on both throttlers', (name) => {
+      const handler = ApprovalsController.prototype[name];
+      expect(Reflect.getMetadata(`${THROTTLER_LIMIT}default`, handler)).toBeGreaterThan(0);
+      expect(Reflect.getMetadata(`${THROTTLER_LIMIT}auth`, handler)).toBeGreaterThan(0);
+    });
+
+    it.each(['default', 'auth'])(
+      'does not rate-limit the list on the %s throttler: the page refreshes on every signing event, and a 429 would hide a hold while it expires',
       (name) => {
-        const handler = ApprovalsController.prototype[name];
-        expect(Reflect.getMetadata(`${THROTTLER_LIMIT}default`, handler)).toBeGreaterThan(0);
-        expect(Reflect.getMetadata(`${THROTTLER_LIMIT}auth`, handler)).toBeGreaterThan(0);
+        expect(
+          Reflect.getMetadata(`THROTTLER:SKIP${name}`, ApprovalsController.prototype.list),
+        ).toBe(true);
       },
     );
 
     it('allows far fewer decisions than reads', () => {
-      const limit = (name: 'list' | 'approve') =>
+      const limit = (name: 'get' | 'approve') =>
         Reflect.getMetadata(
           `${THROTTLER_LIMIT}auth`,
           ApprovalsController.prototype[name],
         ) as number;
-      expect(limit('approve')).toBeLessThan(limit('list'));
+      expect(limit('approve')).toBeLessThan(limit('get'));
     });
   });
 
@@ -85,6 +92,17 @@ describe('ApprovalsController', () => {
       expect(mine).toHaveLength(1);
       expect(mine[0]?.token).toBe(hold.token);
       expect(controller.list(as('user-3')).approvals).toEqual([]);
+    });
+
+    it('says whether anything can be asked at all: no PUBLIC_BASE_URL, no link to send', () => {
+      expect(controller.list(as('user-1')).canAsk).toBe(false);
+      const withUrl = new ApprovalsController(
+        new ApprovalService({ ttlMs: 100_000, publicBaseUrl: 'https://signer.example.test' }, {
+          publishUserActivity: vi.fn().mockResolvedValue(undefined),
+        } as unknown as EventsService),
+        connections as unknown as ConnectionsService,
+      );
+      expect(withUrl.list(as('user-1')).canAsk).toBe(true);
     });
 
     it("returns 404 for another user's token, the same as for one that does not exist", () => {
@@ -129,6 +147,13 @@ describe('ApprovalsController', () => {
       );
       expect(await hold.decision).toBe('approved_once');
       expect(connections.grantPermissions).not.toHaveBeenCalled();
+    });
+
+    it('once: removes the pending row the request filed, so "Approve all" cannot turn it into a permanent grant', async () => {
+      await controller.approve(as('user-1'), hold.token, { mode: 'once' });
+      expect(connections.denyRequests).toHaveBeenCalledWith('conn-1', 'user-1', [
+        { method: 'sign_event', kind: 27235 },
+      ]);
     });
 
     it('always: grants the permission FIRST, then settles the hold', async () => {

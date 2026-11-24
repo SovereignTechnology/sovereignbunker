@@ -16,6 +16,8 @@ vi.mock('@/composables/useActivityStream', () => ({
 
 import {
   $approvals,
+  $approvalsCanAsk,
+  $approvalsError,
   $approvalsLoaded,
   $pendingApprovalCount,
   refreshApprovals,
@@ -33,7 +35,7 @@ const item = (token: string): PendingApprovalDto => ({
   createdAt: '2026-11-24T12:00:00.000Z',
   expiresAt: '2026-11-24T12:01:40.000Z',
 });
-const reply = (...tokens: string[]) => ({ approvals: tokens.map(item) });
+const reply = (...tokens: string[]) => ({ approvals: tokens.map(item), canAsk: true });
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
 describe('approvals store', () => {
@@ -55,6 +57,27 @@ describe('approvals store', () => {
       expect(apiGet).toHaveBeenCalledWith('/approvals');
       expect($approvals.get().map((a) => a.token)).toEqual(['a', 'b']);
       expect($pendingApprovalCount.get()).toBe(2);
+      expect($approvalsLoaded.get()).toBe(true);
+    });
+
+    it('remembers whether the server can ask at all (it has no link to send without PUBLIC_BASE_URL)', async () => {
+      expect($approvalsCanAsk.get()).toBe(true);
+      apiGet.mockResolvedValueOnce({ approvals: [], canAsk: false });
+      await refreshApprovals();
+      expect($approvalsCanAsk.get()).toBe(false);
+      apiGet.mockResolvedValueOnce({ approvals: [], canAsk: true });
+      await refreshApprovals();
+      expect($approvalsCanAsk.get()).toBe(true);
+    });
+
+    it('surfaces a failure instead of swallowing it, and clears it once a refresh works', async () => {
+      apiGet.mockRejectedValueOnce(new Error('ThrottlerException: Too Many Requests'));
+      await expect(refreshApprovals()).resolves.toBe(false);
+      expect($approvalsError.get()).toContain('Too Many Requests');
+      expect($approvalsLoaded.get()).toBe(false);
+      apiGet.mockResolvedValueOnce(reply('a'));
+      await refreshApprovals();
+      expect($approvalsError.get()).toBe('');
       expect($approvalsLoaded.get()).toBe(true);
     });
 
@@ -110,14 +133,40 @@ describe('approvals store', () => {
       expect($pendingApprovalCount.get()).toBe(1);
     });
 
-    it('reloads when the server pushes an activity event', async () => {
+    it('reloads when the server pushes an activity event, a second after the last one', async () => {
       apiGet.mockResolvedValue(reply());
       startApprovalWatch();
       await flush();
       apiGet.mockResolvedValue(reply('x', 'y', 'z'));
       streams[0]!.handlers.onActivity();
-      await flush();
+      await vi.advanceTimersByTimeAsync(999);
+      expect($pendingApprovalCount.get()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
       expect($pendingApprovalCount.get()).toBe(3);
+    });
+
+    it('a burst of activity events is ONE reload: a client spamming ping cannot push the page past its rate limit', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      await flush();
+      apiGet.mockClear();
+      for (let i = 0; i < 200; i++) {
+        streams[0]!.handlers.onActivity();
+        await vi.advanceTimersByTimeAsync(10);
+      }
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(apiGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('a debounced reload does not outlive the watch', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      await flush();
+      apiGet.mockClear();
+      streams[0]!.handlers.onActivity();
+      stopApprovalWatch();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(apiGet).not.toHaveBeenCalled();
     });
 
     it('polls only slowly while the stream is up', async () => {

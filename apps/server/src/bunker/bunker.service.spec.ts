@@ -1316,7 +1316,12 @@ describe('BunkerService', () => {
       const handleRequest = vi.fn(async (...args: unknown[]) => {
         const req = args[2] as Nip46Request;
         const resolution = args[9];
+        const holdAllowed = args[10];
         passes.push({ id: req.id, resolution });
+        // The real handler refuses at once when the caller says the request may not be held.
+        if (resolution === undefined && holdAllowed === false) {
+          return { id: req.id, error: DENIED };
+        }
         if (resolution === undefined) {
           const hold = real.open({
             userId: 'user-1',
@@ -1324,6 +1329,7 @@ describe('BunkerService', () => {
             connectionName: 'BIES',
             clientPubkey: clientPk,
             requestId: req.id,
+            fingerprint: JSON.stringify(req.params),
             permission: { method: 'sign_event', kind: 27235 },
           })!;
           return { id: req.id, hold };
@@ -1368,6 +1374,12 @@ describe('BunkerService', () => {
           handleIncomingEvent(e: object, nsec: string, pk: string, r: string[]): Promise<boolean>;
         }
       ).handleIncomingEvent(wireEvent('e'.repeat(64), request), signerNsec, signerPk, relays);
+    const deliverEvent = (svc: BunkerService, event: object) =>
+      (
+        svc as unknown as {
+          handleIncomingEvent(e: object, nsec: string, pk: string, r: string[]): Promise<boolean>;
+        }
+      ).handleIncomingEvent(event, signerNsec, signerPk, relays);
     const replies = (publish: ReturnType<typeof vi.fn>) =>
       publish.mock.calls.map(([, event]) => {
         const e = event as { content: string };
@@ -1457,6 +1469,39 @@ describe('BunkerService', () => {
       await done;
       expect(passes[1]?.resolution).toBe('cancelled');
       expect(replies(publish)[1]).toEqual({ id: 'req-1', error: DENIED });
+      await svc.onModuleDestroy();
+    });
+
+    it('a retry with a NEW event but the same request id shares the hold: one auth_url, one decision, an answer to each', async () => {
+      const { svc, real, publish } = await setup();
+      const first = deliverEvent(svc, wireEvent('1'.repeat(64), loginRequest('req-7')));
+      await settle();
+      const second = deliverEvent(svc, wireEvent('2'.repeat(64), loginRequest('req-7')));
+      await settle();
+
+      // BIES treats a second auth_url for one id as a refusal: there must be exactly one.
+      expect(real.list('user-1')).toHaveLength(1);
+      expect(replies(publish).filter((r) => r['result'] === 'auth_url')).toHaveLength(1);
+
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'denied');
+      expect(await Promise.all([first, second])).toEqual([true, true]);
+      const finals = replies(publish).filter((r) => r['result'] !== 'auth_url');
+      expect(finals).toEqual([
+        { id: 'req-7', error: DENIED },
+        { id: 'req-7', error: DENIED },
+      ]);
+      await svc.onModuleDestroy();
+    });
+
+    it('a request created before this process started is never held: relays redeliver it after a restart, and its client has long been answered', async () => {
+      const { svc, real, publish } = await setup();
+      const old = {
+        ...wireEvent('3'.repeat(64), loginRequest('req-old')),
+        created_at: Math.floor(Date.now() / 1000) - 120,
+      };
+      expect(await deliverEvent(svc, old)).toBe(true);
+      expect(real.list('user-1')).toHaveLength(0);
+      expect(replies(publish)).toEqual([{ id: 'req-old', error: DENIED }]);
       await svc.onModuleDestroy();
     });
 

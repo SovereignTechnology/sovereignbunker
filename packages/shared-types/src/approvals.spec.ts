@@ -61,6 +61,14 @@ describe('PermissionListSchema', () => {
     expect(PermissionListSchema.parse([])).toEqual([]);
   });
 
+  it('accepts kind 0 and kind 65535, the first and the last', () => {
+    const list = [
+      { method: 'sign_event', kind: 0 },
+      { method: 'sign_event', kind: 65535 },
+    ];
+    expect(PermissionListSchema.parse(list)).toEqual(list);
+  });
+
   it('accepts method-level and kind-scoped entries', () => {
     const list = [{ method: 'sign_event', kind: 27235 }, { method: 'nip44_decrypt' }];
     expect(PermissionListSchema.parse(list)).toEqual(list);
@@ -72,6 +80,8 @@ describe('PermissionListSchema', () => {
     ['an unknown method', [{ method: 'delete_everything' }]],
     ['a negative kind', [{ method: 'sign_event', kind: -1 }]],
     ['a fractional kind', [{ method: 'sign_event', kind: 1.5 }]],
+    ['a kind above 65535 (an event kind is 16 bits)', [{ method: 'sign_event', kind: 65536 }]],
+    ['a kind beyond the database integer', [{ method: 'sign_event', kind: 3_000_000_000 }]],
     ['a string kind', [{ method: 'sign_event', kind: '1' }]],
     ['a null entry', [null]],
   ])('rejects %s', (_name, value) => {

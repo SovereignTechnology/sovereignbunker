@@ -15,7 +15,7 @@ describe('BunkerRpcHandler', () => {
   let loggingService: Partial<LoggingService>;
   let eventsService: Partial<EventsService>;
   let encryption: Partial<EncryptionService>;
-  let approvals: { open: ReturnType<typeof vi.fn> };
+  let approvals: { open: ReturnType<typeof vi.fn>; canAsk: boolean };
 
   const signEvent = vi.fn().mockResolvedValue('{"sig":"deadbeef"}');
   const nip04Encrypt = vi.fn().mockResolvedValue('enc04');
@@ -55,7 +55,7 @@ describe('BunkerRpcHandler', () => {
     return { id, method, params } as Nip46Request;
   }
 
-  function handle(req: Nip46Request, resolution?: ApprovalOutcome) {
+  function handle(req: Nip46Request, resolution?: ApprovalOutcome, holdAllowed?: boolean) {
     return handler.handleRequest(
       CLIENT,
       SIGNER,
@@ -67,6 +67,7 @@ describe('BunkerRpcHandler', () => {
       nip44Decrypt,
       getPublicKeyFromNsec,
       resolution,
+      holdAllowed,
     );
   }
 
@@ -85,7 +86,7 @@ describe('BunkerRpcHandler', () => {
     loggingService = { logSigningAction: vi.fn().mockResolvedValue(undefined as never) };
     eventsService = { publishUserActivity: vi.fn().mockResolvedValue(undefined as never) };
     encryption = { decrypt: vi.fn().mockReturnValue('nsec-hex') };
-    approvals = { open: vi.fn() };
+    approvals = { open: vi.fn(), canAsk: true };
     handler = new BunkerRpcHandler(
       connections as ConnectionsService,
       loggingService as LoggingService,
@@ -434,17 +435,39 @@ describe('BunkerRpcHandler', () => {
       ['a string kind', JSON.stringify({ kind: '1', content: 'x', tags: [] })],
       ['a negative kind', JSON.stringify({ kind: -1, content: 'x', tags: [] })],
       ['a fractional kind', JSON.stringify({ kind: 1.5, content: 'x', tags: [] })],
+      ['a kind above 65535', JSON.stringify({ kind: 65536, content: 'x', tags: [] })],
+      ['a kind beyond the database integer', JSON.stringify({ kind: 3e9, content: 'x', tags: [] })],
     ])('refuses %s without filing a method-level permission request', async (_name, eventJson) => {
       // A pending sign_event row without a kind means "every kind": approving it would grant all.
       vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
         makeConnection([], 'ACTIVE', undefined, 'ASK') as never,
       );
       const res = await handle(request('sign_event', [eventJson]));
-      expect(res.error).toBe('Invalid event: kind must be a non-negative integer');
+      expect(res.error).toBe('Invalid event: kind must be a whole number from 0 to 65535');
       expect(res.hold).toBeUndefined();
       expect(connections.requestPermissions).not.toHaveBeenCalled();
       expect(approvals.open).not.toHaveBeenCalled();
       expect(signEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('kind range', () => {
+    it('signs nothing for a kind outside 0..65535 even under a wildcard grant, so every signature has an audit row', async () => {
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        makeConnection([{ method: 'sign_event' }]) as never,
+      );
+      const res = await handle(request('sign_event', [signEventJson(3_000_000_000)]));
+      expect(res.error).toBe('Invalid event: kind must be a whole number from 0 to 65535');
+      expect(signEvent).not.toHaveBeenCalled();
+    });
+
+    it('signs kind 65535, the last one there is', async () => {
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        makeConnection([{ method: 'sign_event' }]) as never,
+      );
+      const res = await handle(request('sign_event', [signEventJson(65535)]));
+      expect(res.error).toBeUndefined();
+      expect(signEvent).toHaveBeenCalled();
     });
   });
 
@@ -490,12 +513,20 @@ describe('BunkerRpcHandler', () => {
         connectionName: 'Test App',
         clientPubkey: CLIENT,
         requestId: 'req-1',
+        fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
         permission: { method: 'sign_event', kind: LOGIN_KIND },
         preview: {
           kind: LOGIN_KIND,
           content: 'https://app.example/login',
           contentTruncated: false,
-          tagNames: ['u', 'method'],
+          contentLength: 25,
+          tagCount: 2,
+          // Values, not just names: kind 27235 is told apart by the URL it signs for.
+          tags: [
+            { name: 'u', values: ['https://app.example/login'] },
+            { name: 'method', values: ['POST'] },
+          ],
+          httpAuth: { host: 'app.example', path: '/login', method: 'POST' },
         },
       });
       // Nothing is signed, and nothing is logged until the request is answered.
@@ -512,14 +543,65 @@ describe('BunkerRpcHandler', () => {
       ]);
     });
 
-    it('holds a refused decrypt as a method-level request, with no event preview', async () => {
+    it('holds a refused decrypt as a method-level request, showing the peer and the ciphertext length', async () => {
       asking();
       approvals.open.mockReturnValue(aHold());
       const res = await handle(request('nip44_decrypt', ['third-party-pubkey', 'ciphertext']));
       expect(res.hold).toBeDefined();
       expect(approvals.open).toHaveBeenCalledWith(
-        expect.objectContaining({ permission: { method: 'nip44_decrypt' }, preview: undefined }),
+        expect.objectContaining({
+          permission: { method: 'nip44_decrypt' },
+          preview: { peer: 'third-party-pubkey', ciphertextLength: 10 },
+        }),
       );
+    });
+
+    it('holds a refused encrypt, showing the peer and what would be encrypted', async () => {
+      asking();
+      approvals.open.mockReturnValue(aHold());
+      await handle(request('nip04_encrypt', ['third-party-pubkey', 'meet at noon']));
+      expect(approvals.open).toHaveBeenCalledWith(
+        expect.objectContaining({
+          permission: { method: 'nip04_encrypt' },
+          preview: {
+            peer: 'third-party-pubkey',
+            content: 'meet at noon',
+            contentTruncated: false,
+            contentLength: 12,
+          },
+        }),
+      );
+    });
+
+    it('asks the same thing twice under one id with the same fingerprint, and another thing under a different one', async () => {
+      asking();
+      approvals.open.mockReturnValue(aHold());
+      await handle(request('sign_event', [loginEvent]));
+      await handle(request('sign_event', [loginEvent]));
+      await handle(request('sign_event', [signEventJson(1)]));
+      const prints = approvals.open.mock.calls.map(
+        ([arg]) => (arg as { fingerprint: string }).fingerprint,
+      );
+      expect(prints[0]).toBe(prints[1]);
+      expect(prints[2]).not.toBe(prints[0]);
+    });
+
+    it('without a PUBLIC_BASE_URL nothing is held: the client could never be told where to approve, so it is refused at once', async () => {
+      approvals.canAsk = false;
+      asking();
+      const res = await handle(request('sign_event', [loginEvent]));
+      expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+      expect(approvals.open).not.toHaveBeenCalled();
+      expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+        expect.objectContaining({ result: 'DENIED' }),
+      );
+    });
+
+    it('a request the caller says may not be held (made before this process started) is refused at once', async () => {
+      asking();
+      const res = await handle(request('sign_event', [loginEvent]), undefined, false);
+      expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+      expect(approvals.open).not.toHaveBeenCalled();
     });
 
     it('does not hold a request the connection may already make', async () => {
@@ -619,6 +701,19 @@ describe('BunkerRpcHandler', () => {
               errorMessage: DENIED_TEXT,
               metadata: { approval: outcome },
             }),
+          );
+        },
+      );
+
+      it.each(['denied', 'expired'] as const)(
+        '%s is final: a grant that appeared in the meantime does not make the request sign',
+        async (outcome) => {
+          asking([{ method: 'sign_event', kind: LOGIN_KIND }]);
+          const res = await handle(request('sign_event', [loginEvent]), outcome);
+          expect(res.error).toBe(DENIED_TEXT);
+          expect(signEvent).not.toHaveBeenCalled();
+          expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+            expect.objectContaining({ result: 'DENIED', metadata: { approval: outcome } }),
           );
         },
       );

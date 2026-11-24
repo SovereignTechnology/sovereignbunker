@@ -44,4 +44,28 @@ describe('permissions', () => {
     const granted = [{ method: 'sign_event' as const, kind: 1 }];
     expect(checkPermission(granted, { method: 'sign_event', kind: 2 })).toBe(false);
   });
+
+  describe('kind range', () => {
+    it.each([
+      'sign_event:65536',
+      'sign_event:3000000000',
+      'sign_event:abc',
+      'sign_event:-4',
+      'sign_event:1.5',
+    ])('refuses %s: it could never be signed and would not fit the database', (perm) => {
+      expect(() => parsePermissionString(perm)).toThrow();
+    });
+
+    it('keeps 0 and 65535', () => {
+      expect(parsePermissionString('sign_event:0').kind).toBe(0);
+      expect(parsePermissionString('sign_event:65535').kind).toBe(65535);
+    });
+
+    it('a list skips the entries it refuses and keeps the rest', () => {
+      expect(parsePermissionList('sign_event:1,sign_event:3000000000,nip44_decrypt')).toEqual([
+        { method: 'sign_event', kind: 1 },
+        { method: 'nip44_decrypt', kind: undefined },
+      ]);
+    });
+  });
 });

@@ -8,7 +8,9 @@ import { BunkerService } from '../src/bunker/bunker.service.js';
 import { BunkerRpcHandler } from '../src/bunker/bunker-rpc.handler.js';
 import { ApprovalService } from '../src/bunker/approval.service.js';
 import { ApprovalsController } from '../src/bunker/approvals.controller.js';
+import { ConnectionsController } from '../src/connections/connections.controller.js';
 import type { ConnectionsService } from '../src/connections/connections.service.js';
+import type { BunkerService as BunkerServiceType } from '../src/bunker/bunker.service.js';
 import type { LoggingService } from '../src/logging/logging.service.js';
 import type { EventsService } from '../src/events/events.service.js';
 import type { EncryptionService } from '../src/common/crypto/encryption.service.js';
@@ -144,7 +146,12 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     if (opts.grant) conn.permissions.push({ method: 'sign_event', kind: 27235, allowed: true });
     const connections = {
       findByClientAndSigner: vi.fn(async () => conn),
-      updateConnectionStatus: vi.fn(),
+      // What the real service does with a status change, so a revoke has to come from production code.
+      updateConnectionStatus: vi.fn(async (_id: string, status: string) => {
+        conn.status = status;
+        return conn;
+      }),
+      getConnection: vi.fn(async () => conn),
       requestPermissions: vi.fn(async () => undefined),
       touchActivity: vi.fn(async () => undefined),
       denyRequests: vi.fn(async () => undefined),
@@ -187,6 +194,12 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     const asOwner = { user: { sub: USER } } as unknown as Parameters<
       ApprovalsController['list']
     >[0];
+    // The real revoke route: it sets the status and ends the holds, or the test below fails.
+    const connectionsController = new ConnectionsController(
+      connections as unknown as ConnectionsService,
+      svc as unknown as BunkerServiceType,
+      approvals,
+    );
 
     // The client: nostr-tools' own NIP-46 signer, the one BIES uses.
     const authUrls: string[] = [];
@@ -233,11 +246,8 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
       authUrls,
       login,
       oneHold,
-      // What revoking does: the status changes, and the holds of the connection are ended.
-      revoke: () => {
-        conn.status = 'REVOKED';
-        approvals.cancelForConnection(conn.id);
-      },
+      revoke: () =>
+        connectionsController.updateStatus(asOwner as never, conn.id, { status: 'REVOKED' }),
     };
   }
 
@@ -253,7 +263,15 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     // The client has been told to wait, and is still waiting: nothing has settled it.
     await new Promise((r) => setTimeout(r, 200));
     expect(settled).not.toHaveBeenCalled();
-    expect(hold.preview).toMatchObject({ kind: 27235, tagNames: ['u', 'method'] });
+    // The URL the login is for is what tells it apart from a login that deletes an account.
+    expect(hold.preview).toMatchObject({
+      kind: 27235,
+      tags: [
+        { name: 'u', values: ['https://app.example/login'] },
+        { name: 'method', values: ['POST'] },
+      ],
+      httpAuth: { host: 'app.example', path: '/login', method: 'POST' },
+    });
 
     await t.controller.approve(t.asOwner, hold.token, { mode: 'once' });
     const signed = await pending;
@@ -338,8 +356,16 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     const pending = t.login();
     void pending.catch(() => undefined);
     await until(() => t.approvals.list(USER).length === 1, 'the hold');
-    t.revoke();
+    // Through the real route: the status is set by it, not by the test.
+    expect(t.conn.status).toBe('ACTIVE');
+    await t.revoke();
+    expect(t.conn.status).toBe('REVOKED');
     await expect(pending).rejects.toThrow('Connection revoked');
+    expect(t.approvals.size).toBe(0);
+    // Nothing was signed, and what was logged is a refusal, never an approval.
+    expect(t.logSigningAction).not.toHaveBeenCalledWith(
+      expect.objectContaining({ result: 'APPROVED' }),
+    );
   });
 
   it('a connection that is not in ask mode never holds: refused at once, no auth_url (what ngit and other clients see)', async () => {
