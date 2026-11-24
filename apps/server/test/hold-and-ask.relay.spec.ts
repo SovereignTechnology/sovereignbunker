@@ -44,8 +44,13 @@ type Filter = { kinds?: number[]; since?: number; '#p'?: string[] };
 type RelayEvent = { id: string; kind: number; created_at: number; tags: string[][] };
 
 /** Just enough relay for NIP-46: stores events, serves REQ (with stored events), pushes new ones. */
-function startRelay() {
+async function startRelay() {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  // The port is only known once the server is listening.
+  await new Promise<void>((resolve, reject) => {
+    wss.once('listening', resolve);
+    wss.once('error', reject);
+  });
   const stored: RelayEvent[] = [];
   const subs = new Map<ServerSocket, Map<string, Filter[]>>();
 
@@ -103,11 +108,11 @@ const until = async (cond: () => boolean, what: string, ms = 5000) => {
 };
 
 describe('hold and ask: a real NIP-46 client against the real signer, over a relay', () => {
-  let relay: ReturnType<typeof startRelay>;
+  let relay: Awaited<ReturnType<typeof startRelay>>;
   const cleanups: Array<() => Promise<void> | void> = [];
 
-  beforeAll(() => {
-    relay = startRelay();
+  beforeAll(async () => {
+    relay = await startRelay();
   });
   afterAll(async () => {
     await relay.close();

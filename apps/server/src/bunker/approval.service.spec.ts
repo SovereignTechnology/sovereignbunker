@@ -10,8 +10,9 @@ describe('ApprovalService', () => {
   let publish: ReturnType<typeof vi.fn>;
   let service: ApprovalService;
 
-  const make = (publicBaseUrl: string | undefined = 'https://signer.example.test:50217') =>
-    new ApprovalService({ ttlMs: TTL, publicBaseUrl }, {
+  // `null` means no PUBLIC_BASE_URL (undefined would fall back to the default here).
+  const make = (publicBaseUrl: string | null = 'https://signer.example.test:50217') =>
+    new ApprovalService({ ttlMs: TTL, publicBaseUrl: publicBaseUrl ?? undefined }, {
       publishUserActivity: publish,
     } as unknown as EventsService);
 
@@ -63,7 +64,7 @@ describe('ApprovalService', () => {
     });
 
     it('is undefined without a PUBLIC_BASE_URL (the hold still works)', () => {
-      const bare = make(undefined);
+      const bare = make(null);
       const { token } = bare.open(input())!;
       expect(bare.authUrl(token)).toBeUndefined();
       bare.onModuleDestroy();
