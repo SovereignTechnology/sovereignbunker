@@ -18,6 +18,18 @@ into `main` are done locally, never with GitHub's or GitLab's merge button.
 
 ## What differs from upstream
 
+- **Hold and ask** (ours; not yet offered upstream). A connection set to `ASK` holds a request it has no
+  permission for instead of refusing it: the client gets one NIP-46 `auth_url` reply pointing at the
+  Approvals page, the operator answers there (allow once, always allow, deny), and the client then gets the
+  final reply under the same request id. Refusals and timeouts keep the exact text
+  `Permission denied for sign_event kind:N`. This is what lets BIES log in through a remote signer. Details
+  and the two settings (`PUBLIC_BASE_URL`, `ASK_APPROVAL_TTL_MS`) are in the README. The default stays
+  `DENY`, so no existing connection changes behaviour. Alongside it:
+  - the operator's permission choice at creation is honoured as sent (an empty choice means no
+    permissions, a bad one is a 400, and the old `perms` string that was silently dropped on error is gone);
+  - repeated requests no longer pile up duplicate pending rows for the same method (a migration cleans
+    existing duplicates and never drops a grant);
+  - a refusal is logged as `DENIED`, not `ERROR`.
 - **Carried fixes** that we also offered upstream, listed newest first:
   - `connect` replies `ack` unless the request presents the connection's own secret. This is upstream
     PR #26; rust-nostr clients such as ngit 3.x need it to sign at all.

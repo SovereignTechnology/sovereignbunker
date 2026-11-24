@@ -93,6 +93,7 @@ cp .env.example .env
 # Optional: set REDIS_URL=redis://localhost:6379 in .env for live dashboard/connections updates
 # Optional: set ALLOW_REGISTRATION=false to disable new user sign-ups (backend returns 403; frontend hides register link)
 # Optional: set TRUST_PROXY=true when the API is behind a reverse proxy (e.g. Caddy) so session IPs and rate limiting use the real client IP
+# Optional: set PUBLIC_BASE_URL=https://bunker.example.com to let connections in ask mode hold requests for your approval (see Hold and ask)
 
 # Generate Prisma client (required; runs automatically on pnpm install) & run migrations
 pnpm db:generate
@@ -155,6 +156,7 @@ ENCRYPTION_KEY=$(openssl rand -base64 48)
 CORS_ORIGINS=https://bunker.example.com
 WEBAUTHN_RP_ID=bunker.example.com
 WEBAUTHN_ORIGIN=https://bunker.example.com
+PUBLIC_BASE_URL=https://bunker.example.com
 EOF
 
 # 2. Build and run all services
@@ -173,6 +175,7 @@ open http://localhost:8080
 - [ ] TLS terminated by a reverse proxy (Caddy/Nginx); only the web/proxy entrypoint is exposed publicly
 - [ ] `TRUST_PROXY=true` set **only** when the app is reachable solely through that trusted proxy
 - [ ] `CORS_ORIGINS`, `WEBAUTHN_RP_ID`, `WEBAUTHN_ORIGIN` set to your real public origin
+- [ ] `PUBLIC_BASE_URL` set to that same public origin if any connection uses ask mode (otherwise the client gets no approval link)
 - [ ] `ALLOW_REGISTRATION` left disabled (default) unless you intend open sign-ups; the first account can still be created on first run
 - [ ] Postgres/Redis not published to the host (default) — reachable only over the internal Docker network
 - [ ] Database backups and a tested restore procedure in place
@@ -185,10 +188,37 @@ This tool implements the full [NIP-46 Nostr Remote Signing](https://nips.nostr.c
 
 - **URI Support**: Parse and generate both `bunker://` and `nostrconnect://` URIs
 - **All RPC Methods**: `connect`, `sign_event`, `ping`, `get_public_key`, `nip04_encrypt/decrypt`, `nip44_encrypt/decrypt`, `switch_relays`
-- **Fine-grained Permissions**: Per-connection method and event-kind restrictions, enforced default-deny (a connection with no permissions can sign/decrypt nothing). New connections get a conservative default set (common signing kinds, no decryption). Following the NIP-46 model for a non-interactive signer, a connecting client may declare the scope it needs in its `connect` request and that becomes the connection's permission set, so **only connect clients you trust with the bound key**; operators can tighten any connection's permissions in the dashboard at any time.
+- **Fine-grained Permissions**: Per-connection method and event-kind restrictions, enforced default-deny (a connection with no permissions can sign/decrypt nothing). The operator chooses what a connection may do when it is created: a `bunker://` URI you generate starts from the permissions you pick, and a `nostrconnect://` URI you import starts from the conservative default set (common signing kinds, no decryption) unless you change it. Following the NIP-46 model for a non-interactive signer, a connecting client may also declare the scope it needs in its `connect` request and that becomes the connection's permission set, so **only connect clients you trust with the bound key**; operators can tighten any connection's permissions in the dashboard at any time.
+- **Hold and ask**: a connection can be set to ask you instead of refusing a request it has no permission for. See [Hold and ask](#hold-and-ask) below.
 - **NIP-44 Encryption**: All communication encrypted using NIP-44
-- **Auth Challenges**: Support for out-of-band authentication
+- **Auth Challenges**: A held request answers with a NIP-46 `auth_url` reply that points at the Approvals page (see [Hold and ask](#hold-and-ask))
 - **Relay Management**: Configurable relays per connection with automatic reconnection
+
+### Hold and ask
+
+By default a request the connection has no permission for is refused at once with
+`Permission denied for sign_event kind:N`, and the request is filed in the connection's permissions as pending.
+
+A connection can instead be set to **ask** (`approvalMode: ASK`, "Ask me" when generating or importing a
+connection, or "Ask me instead of refusing" on its detail page). The signer then **holds** such a request:
+
+1. It sends the client one interim reply, `{"id": <request id>, "result": "auth_url", "error": "<PUBLIC_BASE_URL>/approvals/<token>"}`, and keeps the request waiting.
+2. You open that link (it needs your normal login, and 2FA if you use it) and choose **Allow once**, **Always allow** or **Deny** on the Approvals page. A badge in the navigation shows how many requests are waiting.
+3. The signer sends the client the final reply under the same request id: the signed result, or the unchanged `Permission denied for sign_event kind:N`. A request nobody answers within `ASK_APPROVAL_TTL_MS` is refused with that same text.
+
+*Allow once* signs that one request and stores nothing. *Always allow* stores the permission, so the next request needs no answer.
+Always allowing a login (`sign_event` kind 27235) lets that connection sign in to any site as you, including sites where signing in can delete an
+account, so the page asks you to confirm it.
+
+Only turn ask mode on for clients that understand `auth_url` (BIES and other nostr-tools based clients do). A client that does not
+will treat the interim reply as an answer or an error. Revoking, deleting or switching a connection back to refusing cancels its waiting requests.
+At most 10 requests wait per connection and 200 in total; past that, requests are refused as before. Waiting requests live in memory, so a signer
+restart refuses them (the client can ask again).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PUBLIC_BASE_URL` | unset | The origin you open the web UI at, e.g. `https://bunker.example.com` (a private or tailnet address works too). Set it for ask mode: without it the signer still holds the request (it shows on the Approvals page) but cannot build the link, so it sends the client no `auth_url` reply and the client just waits. `http(s)` only, no credentials, query or fragment. |
+| `ASK_APPROVAL_TTL_MS` | `100000` | How long a request waits for your answer, 5000 to 200000. Keep it below the client's own wait (BIES waits about 240 s). |
 
 ## Security
 
