@@ -173,3 +173,8 @@ export interface ApprovalConfig {
 
 /** Nest DI token for {@link ServerEnv.NOSTR_DEFAULT_RELAYS} (effective default relay URLs). */
 export const NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN = 'NOSTR_DEFAULT_RELAYS' as const;
+
+/** TEMPORARY stub so the specs-only commit builds: its specs must fail on behaviour, not on a build error. */
+export function deploymentWarnings(_env: unknown): string[] {
+  return [];
+}
