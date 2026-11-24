@@ -37,7 +37,8 @@ onMounted(() => {
 onUnmounted(() => clearInterval(tick));
 
 const list = computed<PendingApprovalDto[]>(() => {
-  const all = [...approvals.value];
+  // The store hands out deeply readonly data; a copy is sorted, and the list is only read.
+  const all = [...approvals.value] as PendingApprovalDto[];
   // The one that was linked to comes first.
   return all.sort(
     (a, b) => Number(b.token === focusToken.value) - Number(a.token === focusToken.value),
@@ -128,7 +129,9 @@ function askAlways(a: PendingApprovalDto) {
       refused.
     </p>
 
-    <p v-if="error" class="text-sm text-destructive mb-4" role="alert">{{ error }}</p>
+    <p v-if="error" class="text-sm text-destructive mb-4" role="alert">
+      {{ error }}
+    </p>
 
     <!-- What the operator just did -->
     <div
@@ -168,7 +171,9 @@ function askAlways(a: PendingApprovalDto) {
       >
         <div class="flex items-start justify-between gap-3 mb-3">
           <div class="min-w-0">
-            <h2 class="font-semibold truncate">{{ a.connectionName }}</h2>
+            <h2 class="font-semibold truncate">
+              {{ a.connectionName }}
+            </h2>
             <p class="text-xs text-muted-foreground flex items-center gap-1">
               <PubkeyDisplay :pubkey="a.clientPubkey" :truncate="true" />
             </p>
@@ -178,8 +183,12 @@ function askAlways(a: PendingApprovalDto) {
           </Badge>
         </div>
 
-        <p class="font-medium">{{ what(a) }}</p>
-        <p class="text-xs font-mono text-muted-foreground mb-3">{{ permission(a) }}</p>
+        <p class="font-medium">
+          {{ what(a) }}
+        </p>
+        <p class="text-xs font-mono text-muted-foreground mb-3">
+          {{ permission(a) }}
+        </p>
 
         <!-- What it would sign. Shown as text only, never as markup. -->
         <div

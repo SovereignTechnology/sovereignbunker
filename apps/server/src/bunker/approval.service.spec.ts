@@ -299,7 +299,6 @@ describe('previewSignEvent', () => {
     const preview = previewSignEvent(JSON.stringify({ kind: 1, content: evil }))!;
     expect(preview.content).toBe('pay evil  x  z      end');
     expect(preview.content).not.toMatch(
-      // eslint-disable-next-line no-control-regex
       /[\u0080-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/,
     );
   });

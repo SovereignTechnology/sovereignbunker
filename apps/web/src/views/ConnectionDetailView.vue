@@ -547,9 +547,9 @@ function formatTime(ts: string) {
                   <div class="text-xs text-muted-foreground">
                     When this app needs something it has no permission for, it waits for your answer
                     on the
-                    <router-link to="/approvals" class="text-primary hover:underline"
-                      >Approvals</router-link
-                    >
+                    <router-link to="/approvals" class="text-primary hover:underline">
+                      Approvals
+                    </router-link>
                     page instead of being refused. Only for apps that can wait (a NIP-46
                     <code class="font-mono">auth_url</code> reply, as BIES does).
                   </div>

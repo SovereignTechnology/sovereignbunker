@@ -11,7 +11,7 @@ vi.mock('@/composables/useActivityStream', () => ({
   connectActivityStream: (h: unknown) => connectActivityStream(h),
 }));
 
-const routeState = { name: 'dashboard' as string };
+const routeState = { name: 'dashboard' as string, path: '/dashboard' };
 vi.mock('vue-router', () => ({
   useRoute: () => routeState,
   useRouter: () => ({ push: vi.fn() }),
@@ -50,6 +50,7 @@ describe('AppLayout: approvals badge and watch', () => {
     stopStream.mockClear();
     connectActivityStream.mockClear();
     routeState.name = 'dashboard';
+    routeState.path = '/dashboard';
     signedOut();
     apiGet.mockImplementation(async (path: string) =>
       path === '/approvals' ? { approvals: [] } : {},
@@ -183,6 +184,7 @@ describe('AppLayout: approvals badge and watch', () => {
 
   it('does not watch on the login screens, where there is no layout', async () => {
     routeState.name = 'login';
+    routeState.path = '/login';
     const w = mountLayout();
     await flushPromises();
     expect(w.find('[data-testid="approvals-badge"]').exists()).toBe(false);
