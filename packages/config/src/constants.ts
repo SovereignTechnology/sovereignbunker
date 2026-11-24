@@ -36,3 +36,26 @@ export const NOSTR_CONSTANTS = {
   NIP46_SELF_PING_TIMEOUT_MS: 20_000,
   NIP46_SELF_PING_MISSES: 2,
 } as const;
+
+/**
+ * Hold-and-ask approval: a gated request on an `ASK` connection is held for the operator instead of
+ * being refused. The client waits for the final reply (BIES waits about 240 s in all), so the hold
+ * must end, and the signer must answer, well inside that window.
+ */
+export const APPROVAL_CONSTANTS = {
+  /** How long a held request waits for the operator before it is answered as denied. */
+  DEFAULT_TTL_MS: 100_000,
+  MIN_TTL_MS: 5_000,
+  /** Upper bound so a misconfigured TTL cannot outlive a client's own timeout. */
+  MAX_TTL_MS: 200_000,
+  /** Token entropy: 24 random bytes = 192 bits, far above the 128-bit floor. */
+  TOKEN_BYTES: 24,
+  /** Held requests one connection may have open at once; the next is answered as denied. */
+  MAX_HOLDS_PER_CONNECTION: 10,
+  /** Held requests the whole signer may have open at once. */
+  MAX_HOLDS_GLOBAL: 200,
+  /** Event content shown to the operator is cut to this many characters. */
+  PREVIEW_CONTENT_MAX: 280,
+  /** At most this many distinct tag names are shown. */
+  PREVIEW_TAG_NAMES_MAX: 20,
+} as const;

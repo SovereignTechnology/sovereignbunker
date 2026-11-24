@@ -59,3 +59,30 @@ export function checkPermission(
     (g) => g.method === required.method && (g.kind === undefined || g.kind === required.kind),
   );
 }
+
+/**
+ * The methods the signer gates behind an explicit permission (default-deny). The others (connect,
+ * ping, get_public_key, switch_relays) are always available, so they never need granting.
+ */
+export const GATED_PERMISSION_METHODS = [
+  'sign_event',
+  'nip04_encrypt',
+  'nip04_decrypt',
+  'nip44_encrypt',
+  'nip44_decrypt',
+] as const;
+
+/** True when `method` needs an explicit permission (see GATED_PERMISSION_METHODS). */
+export function isGatedMethod(method: string): method is (typeof GATED_PERMISSION_METHODS)[number] {
+  return (GATED_PERMISSION_METHODS as readonly string[]).includes(method);
+}
+
+/**
+ * The event kind clients sign to log in to a website (NIP-98 HTTP auth, e.g. a BIES remote-signer
+ * login). Granting it permanently lets the client sign logins for any site, including ones that
+ * delete an account, so the UI offers "ask each time" first.
+ */
+export const LOGIN_EVENT_KIND = 27235;
+
+/** A bound on any permission list that arrives over the API (the picker offers a few dozen at most). */
+export const MAX_PERMISSIONS_PER_REQUEST = 64;

@@ -95,6 +95,9 @@ model BunkerConnection {
   relays          String[]         @default([])
   secret          String?
   loggingEnabled  Boolean          @default(false) @map("logging_enabled")
+  // What the signer does with a gated request the connection has no permission for: DENY answers
+  // with an error at once (the long-standing behaviour); ASK holds the request for the operator.
+  approvalMode    ApprovalMode     @default(DENY) @map("approval_mode")
   lastActivity    DateTime?        @map("last_activity")
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
@@ -108,6 +111,11 @@ model BunkerConnection {
   @@index([userId])
   @@index([clientPubkey])
   @@map("bunker_connections")
+}
+
+enum ApprovalMode {
+  DENY
+  ASK
 }
 
 enum ConnectionStatus {

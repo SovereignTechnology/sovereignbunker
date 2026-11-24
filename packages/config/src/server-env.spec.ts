@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { NOSTR_CONSTANTS } from './constants.js';
+import { APPROVAL_CONSTANTS, NOSTR_CONSTANTS } from './constants.js';
 import { serverEnvSchema } from './server-env.js';
 
 describe('serverEnvSchema', () => {
@@ -183,6 +183,69 @@ describe('serverEnvSchema', () => {
         NOSTR_DEFAULT_RELAYS: 'ws://relay.example.com',
       });
       expect(result.success).toBe(false);
+    });
+  });
+  describe('PUBLIC_BASE_URL', () => {
+    const parse = (extra: Record<string, string>) => serverEnvSchema.safeParse({ ...baseEnv, ...extra });
+
+    it('is optional: unset and empty both mean no approval link', () => {
+      for (const value of [undefined, '', '   ']) {
+        const result = parse(value === undefined ? {} : { PUBLIC_BASE_URL: value });
+        expect(result.success).toBe(true);
+        if (result.success) expect(result.data.PUBLIC_BASE_URL).toBeUndefined();
+      }
+    });
+
+    it('drops a trailing slash so links are built as base + /approvals/<token>', () => {
+      const result = parse({ PUBLIC_BASE_URL: 'https://signer.example.test:50217/' });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.PUBLIC_BASE_URL).toBe('https://signer.example.test:50217');
+    });
+
+    it('keeps a path prefix for a reverse proxy mounted under one', () => {
+      const result = parse({ PUBLIC_BASE_URL: 'https://example.test/bunker' });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.PUBLIC_BASE_URL).toBe('https://example.test/bunker');
+    });
+
+    it.each([
+      'ftp://example.test',
+      'javascript:alert(1)',
+      'https://user:pass@example.test',
+      'https://example.test/?x=1',
+      'https://example.test/#frag',
+      'not a url',
+    ])('rejects %s', (value) => {
+      expect(parse({ PUBLIC_BASE_URL: value }).success).toBe(false);
+    });
+  });
+
+  describe('ASK_APPROVAL_TTL_MS', () => {
+    const parse = (extra: Record<string, string>) => serverEnvSchema.safeParse({ ...baseEnv, ...extra });
+
+    it('defaults to 100 s, under the 240 s a BIES client waits', () => {
+      const result = parse({});
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.ASK_APPROVAL_TTL_MS).toBe(100_000);
+        expect(result.data.ASK_APPROVAL_TTL_MS).toBe(APPROVAL_CONSTANTS.DEFAULT_TTL_MS);
+      }
+    });
+
+    it('treats an empty value as unset', () => {
+      const result = parse({ ASK_APPROVAL_TTL_MS: '' });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.ASK_APPROVAL_TTL_MS).toBe(100_000);
+    });
+
+    it('accepts a value in range', () => {
+      const result = parse({ ASK_APPROVAL_TTL_MS: '30000' });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.ASK_APPROVAL_TTL_MS).toBe(30_000);
+    });
+
+    it.each(['1000', '250000', '-5', 'abc', '1.5'])('rejects %s', (value) => {
+      expect(parse({ ASK_APPROVAL_TTL_MS: value }).success).toBe(false);
     });
   });
 });

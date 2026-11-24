@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { SafeRelayUrlsSchema } from '@bunker46/shared-types';
-import { NOSTR_CONSTANTS } from './constants.js';
+import { APPROVAL_CONSTANTS, NOSTR_CONSTANTS } from './constants.js';
 
 /**
  * Placeholder/insecure secret detection for production fail-closed checks.
@@ -45,6 +45,50 @@ export const serverEnvSchema = z
     WEBAUTHN_ORIGIN: z.string().default('http://localhost:5173'),
 
     REDIS_URL: z.string().url().optional(),
+
+    /**
+     * Public base URL of this app (e.g. `https://signer.example`), used to build the approval link
+     * a held request sends its client as a NIP-46 `auth_url`: `<PUBLIC_BASE_URL>/approvals/<token>`.
+     * The link opens a page behind the normal login, so it is no bearer link. Unset or empty: a held
+     * request still waits for the operator, but the client is sent no link. http(s) only, no
+     * credentials, query or fragment; a trailing slash is dropped.
+     */
+    PUBLIC_BASE_URL: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z
+        .string()
+        .url()
+        .refine((raw) => {
+          try {
+            const u = new URL(raw);
+            return (
+              (u.protocol === 'https:' || u.protocol === 'http:') &&
+              !u.username &&
+              !u.password &&
+              !u.search &&
+              !u.hash
+            );
+          } catch {
+            return false;
+          }
+        }, 'PUBLIC_BASE_URL must be an http(s) URL without credentials, query or fragment')
+        .transform((raw) => raw.replace(/\/+$/, ''))
+        .optional(),
+    ),
+
+    /**
+     * How long (ms) a held request waits for the operator before it is answered as denied. Keep it
+     * under the client's own timeout (BIES waits about 240 s).
+     */
+    ASK_APPROVAL_TTL_MS: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.coerce
+        .number()
+        .int()
+        .min(APPROVAL_CONSTANTS.MIN_TTL_MS)
+        .max(APPROVAL_CONSTANTS.MAX_TTL_MS)
+        .default(APPROVAL_CONSTANTS.DEFAULT_TTL_MS),
+    ),
 
     /** When "false" or "0", new user registration is disabled (backend and frontend). */
     ALLOW_REGISTRATION: z
@@ -125,6 +169,15 @@ export const serverEnvSchema = z
   });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
+
+/** Nest DI token for the approval settings ({@link ServerEnv.PUBLIC_BASE_URL}, {@link ServerEnv.ASK_APPROVAL_TTL_MS}). */
+export const APPROVAL_CONFIG_INJECTION_TOKEN = 'APPROVAL_CONFIG' as const;
+
+/** What the approval service needs from the environment. */
+export interface ApprovalConfig {
+  ttlMs: number;
+  publicBaseUrl?: string;
+}
 
 /** Nest DI token for {@link ServerEnv.NOSTR_DEFAULT_RELAYS} (effective default relay URLs). */
 export const NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN = 'NOSTR_DEFAULT_RELAYS' as const;
