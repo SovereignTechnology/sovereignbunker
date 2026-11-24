@@ -362,10 +362,12 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     expect(t.conn.status).toBe('REVOKED');
     await expect(pending).rejects.toThrow('Connection revoked');
     expect(t.approvals.size).toBe(0);
-    // Nothing was signed, and what was logged is a refusal, never an approval.
-    expect(t.logSigningAction).not.toHaveBeenCalledWith(
-      expect.objectContaining({ result: 'APPROVED' }),
-    );
+    // Nothing was signed: the handshake (`connect`) was approved, the held sign_event never was.
+    const calls = t.logSigningAction.mock.calls as unknown as [
+      { method?: string; result?: string },
+    ][];
+    const logged = calls.map(([entry]) => entry);
+    expect(logged.filter((e) => e.method === 'sign_event' && e.result === 'APPROVED')).toEqual([]);
   });
 
   it('a connection that is not in ask mode never holds: refused at once, no auth_url (what ngit and other clients see)', async () => {
