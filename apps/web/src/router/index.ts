@@ -1,5 +1,6 @@
-import { createRouter, createWebHistory } from 'vue-router';
+import { createRouter, createWebHistory, type RouteLocationNormalized } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
+import { safeRedirectPath } from '../lib/redirect.js';
 
 const router = createRouter({
   history: createWebHistory(),
@@ -44,6 +45,14 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      // The link a held request sends its client points here: /approvals/<token>. Behind the login
+      // like every other page; with no token it is the list of everything waiting.
+      path: '/approvals/:token?',
+      name: 'approvals',
+      component: () => import('../views/ApprovalsView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
       path: '/connections/:id',
       name: 'connection-detail',
       component: () => import('../views/ConnectionDetailView.vue'),
@@ -82,15 +91,20 @@ const router = createRouter({
   ],
 });
 
-router.beforeEach((to) => {
+/** The navigation guard: protected pages need a session; guest pages are closed to a signed-in user. */
+export function authGuard(to: RouteLocationNormalized) {
   const auth = useAuthStore();
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
-    return { name: 'login' };
+    // Remember where they were going (an approval link, say) so signing in brings them back to it.
+    const redirect = safeRedirectPath(to.fullPath);
+    return redirect ? { name: 'login', query: { redirect } } : { name: 'login' };
   }
   if (to.meta.guest && auth.isAuthenticated) {
     return { name: 'dashboard' };
   }
   return;
-});
+}
+
+router.beforeEach(authGuard);
 
 export { router };

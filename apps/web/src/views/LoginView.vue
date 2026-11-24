@@ -5,6 +5,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useSettingsStore } from '@/stores/settings';
 import { useAuthConfig } from '@/composables/useAuthConfig';
 import { api } from '@/lib/api';
+import { safeRedirectPath } from '@/lib/redirect';
 import type { UserProfileDto } from '@bunker46/shared-types';
 import {
   startAuthentication,
@@ -16,6 +17,9 @@ import Card from '@/components/ui/Card.vue';
 
 const router = useRouter();
 const route = useRoute();
+// Where to go once signed in: the page they were sent from (e.g. an approval link), else the dashboard.
+const redirect = safeRedirectPath(route.query.redirect);
+const afterLogin = redirect ?? '/dashboard';
 const auth = useAuthStore();
 
 const totpEnabledMessage = ref('');
@@ -26,7 +30,7 @@ onMounted(() => {
   loadAuthConfig();
   if (route.query.totpEnabled === '1') {
     totpEnabledMessage.value = 'Two-factor authentication has been enabled. Please sign in again.';
-    router.replace({ path: '/login' });
+    router.replace({ path: '/login', query: redirect ? { redirect } : {} });
   }
 });
 
@@ -60,7 +64,7 @@ async function handleLogin() {
     const requiresTotp = res.requiresTotp === true || res.requires_totp === true;
     if (requiresTotp && partialToken) {
       auth.setRequiresTotp(partialToken);
-      router.push('/2fa/verify');
+      router.push({ path: '/2fa/verify', query: redirect ? { redirect } : {} });
       return;
     }
 
@@ -75,7 +79,7 @@ async function handleLogin() {
       const profile = await api.get<UserProfileDto>('/users/me');
       auth.setUser(profile);
       await settings.load(accessToken);
-      router.push('/dashboard');
+      router.push(afterLogin);
     } catch {
       await auth.logout();
       error.value = 'Session could not be verified. Please try again.';
@@ -124,7 +128,7 @@ async function handlePasskeyLogin() {
         const profile = await api.get<UserProfileDto>('/users/me');
         auth.setUser(profile);
         await settings.load(accessToken);
-        router.push('/dashboard');
+        router.push(afterLogin);
       } catch {
         await auth.logout();
         passkeyError.value = 'Session could not be verified. Please try again.';

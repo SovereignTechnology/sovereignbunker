@@ -1,14 +1,18 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRouter, useRoute } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
 import { useSettingsStore } from '@/stores/settings';
 import { api } from '@/lib/api';
+import { safeRedirectPath } from '@/lib/redirect';
 import Button from '@/components/ui/Button.vue';
 import Input from '@/components/ui/Input.vue';
 import Card from '@/components/ui/Card.vue';
 
 const router = useRouter();
+const route = useRoute();
+// Back to the page they were sent from (an approval link, say), else the dashboard.
+const afterVerify = safeRedirectPath(route.query.redirect) ?? '/dashboard';
 const auth = useAuthStore();
 const settings = useSettingsStore();
 
@@ -27,7 +31,7 @@ async function handleVerify() {
     const profile = await api.get<any>('/users/me');
     auth.setUser(profile);
     await settings.load(res.accessToken);
-    router.push('/dashboard');
+    router.push(afterVerify);
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Invalid code';
   } finally {

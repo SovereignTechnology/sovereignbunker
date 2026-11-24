@@ -2,11 +2,13 @@
 import { ref, onMounted, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { api } from '@/lib/api';
+import { useActivityStream } from '@/composables/useActivityStream';
 import { useFormatting } from '@/composables/useFormatting';
 import Button from '@/components/ui/Button.vue';
 import Card from '@/components/ui/Card.vue';
 import Badge from '@/components/ui/Badge.vue';
 import PubkeyDisplay from '@/components/PubkeyDisplay.vue';
+import { GATED_PERMISSION_METHODS } from '@bunker46/shared-types';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -27,13 +29,7 @@ const logsLoading = ref(false);
 
 // Methods the signer gates behind explicit permission (default-deny). The others
 // (connect, ping, get_public_key, switch_relays) are always available.
-const GATED_METHODS = [
-  'sign_event',
-  'nip04_encrypt',
-  'nip04_decrypt',
-  'nip44_encrypt',
-  'nip44_decrypt',
-];
+const GATED_METHODS = GATED_PERMISSION_METHODS;
 
 type Perm = { method: string; kind?: number | null; allowed?: boolean };
 
@@ -148,6 +144,25 @@ async function denyAllPending() {
   await api.post(`/connections/${route.params.id}/permissions/deny`, {});
   await reloadConnection();
 }
+
+// Hold a request this connection has no permission for until the operator decides (ASK), or refuse
+// it at once (DENY). Turning ASK off answers anything being held right now.
+async function setApprovalMode(mode: 'DENY' | 'ASK') {
+  if (!connection.value || connection.value.approvalMode === mode) return;
+  modeError.value = '';
+  try {
+    await api.patch(`/connections/${route.params.id}/approval-mode`, { mode });
+    connection.value.approvalMode = mode;
+  } catch (err) {
+    modeError.value = err instanceof Error ? err.message : 'Could not change the mode';
+  }
+}
+const modeError = ref('');
+
+// Pending requests and held requests arrive while the page is open: refetch on every activity event.
+useActivityStream(() => {
+  reloadConnection().catch(() => undefined);
+});
 
 async function toggleLogging() {
   if (!connection.value) return;
@@ -525,6 +540,42 @@ function formatTime(ts: string) {
         <Card>
           <h2 class="text-lg font-semibold mb-4">Options</h2>
           <div class="space-y-4">
+            <div>
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <div class="font-medium text-sm">Ask me instead of refusing</div>
+                  <div class="text-xs text-muted-foreground">
+                    When this app needs something it has no permission for, it waits for your answer
+                    on the
+                    <router-link to="/approvals" class="text-primary hover:underline"
+                      >Approvals</router-link
+                    >
+                    page instead of being refused. Only for apps that can wait (a NIP-46
+                    <code class="font-mono">auth_url</code> reply, as BIES does).
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  data-testid="approval-mode-toggle"
+                  :aria-pressed="connection.approvalMode === 'ASK'"
+                  :class="[
+                    'w-12 h-6 rounded-full transition-colors cursor-pointer relative shrink-0',
+                    connection.approvalMode === 'ASK' ? 'bg-primary' : 'bg-muted',
+                  ]"
+                  @click="setApprovalMode(connection.approvalMode === 'ASK' ? 'DENY' : 'ASK')"
+                >
+                  <span
+                    :class="[
+                      'absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform',
+                      connection.approvalMode === 'ASK' ? 'left-6' : 'left-0.5',
+                    ]"
+                  />
+                </button>
+              </div>
+              <p v-if="modeError" class="text-xs text-destructive mt-1" role="alert">
+                {{ modeError }}
+              </p>
+            </div>
             <div class="flex items-center justify-between">
               <div>
                 <div class="font-medium text-sm">Detailed Logging</div>
