@@ -12,12 +12,12 @@ config(); // then cwd .env so local overrides win
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyCookie from '@fastify/cookie';
 import { AppModule } from './app.module.js';
-import { serverEnvSchema } from '@bunker46/config';
+import { deploymentWarnings, serverEnvSchema } from '@bunker46/config';
 import { installProcessGuards } from './common/process-guards.js';
 
 async function bootstrap() {
@@ -26,6 +26,7 @@ async function bootstrap() {
   installProcessGuards();
 
   const env = serverEnvSchema.parse(process.env);
+  for (const warning of deploymentWarnings(env)) new Logger('Bootstrap').warn(warning);
 
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,

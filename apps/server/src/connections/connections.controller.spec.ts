@@ -104,6 +104,27 @@ describe('ConnectionsController', () => {
     });
   });
 
+  describe('replacing the granted permissions (PUT :id/permissions)', () => {
+    const put = (permissions: unknown) => controller.setPermissions(req, 'conn-1', { permissions });
+
+    it('stores a valid list', async () => {
+      const list = [{ method: 'sign_event', kind: 1 }, { method: 'nip44_decrypt' }];
+      await put(list);
+      expect(service['setPermissions']).toHaveBeenCalledWith('conn-1', list);
+    });
+
+    it.each([
+      ['a kind beyond 65535', [{ method: 'sign_event', kind: 3_000_000_000 }]],
+      ['a negative kind', [{ method: 'sign_event', kind: -1 }]],
+      ['an unknown method', [{ method: 'delete_everything' }]],
+      ['no list', undefined],
+      ['a string', 'sign_event'],
+    ])('refuses %s with 400 and stores nothing', async (_name, permissions) => {
+      await expect(put(permissions)).rejects.toThrow(BadRequestException);
+      expect(service['setPermissions']).not.toHaveBeenCalled();
+    });
+  });
+
   describe('create: approval mode', () => {
     it.each(['DENY', 'ASK'])('passes %s to the service', async (approvalMode) => {
       await create({ approvalMode });

@@ -173,14 +173,14 @@ open http://localhost:8080
 
 - [ ] Strong, unique `JWT_SECRET`, `JWT_REFRESH_SECRET`, `ENCRYPTION_KEY` (not the dev placeholders — the server refuses to start with them when `NODE_ENV=production`)
 - [ ] TLS terminated by a reverse proxy (Caddy/Nginx); only the web/proxy entrypoint is exposed publicly
-- [ ] `TRUST_PROXY=true` set **only** when the app is reachable solely through that trusted proxy
+- [ ] `TRUST_PROXY=true` set **only** when the app is reachable solely through that trusted proxy (it is not set by `docker-compose.yml`; without it every caller behind the proxy shares one throttle bucket)
 - [ ] `CORS_ORIGINS`, `WEBAUTHN_RP_ID`, `WEBAUTHN_ORIGIN` set to your real public origin
-- [ ] `PUBLIC_BASE_URL` set to that same public origin if any connection uses ask mode (otherwise the client gets no approval link)
+- [ ] `PUBLIC_BASE_URL` set to that same public origin (https) if any connection uses ask mode (otherwise ask mode is unavailable and such requests are refused at once)
 - [ ] `ALLOW_REGISTRATION` left disabled (default) unless you intend open sign-ups; the first account can still be created on first run
 - [ ] Postgres/Redis not published to the host (default) — reachable only over the internal Docker network
 - [ ] Database backups and a tested restore procedure in place
 
-When running behind a reverse proxy (e.g. Caddy, Nginx), set `TRUST_PROXY=true` (or `1` / `yes`) in the server environment so that session IPs and throttling use the client IP from `X-Forwarded-For` / `X-Real-IP`. Only enable this when the app is only reachable through a trusted proxy.
+When running behind a reverse proxy (e.g. Caddy, Nginx), set `TRUST_PROXY=true` (or `1` / `yes`) in the server environment so that session IPs and throttling use the client IP from `X-Forwarded-For` / `X-Real-IP`. Only enable this when the app is only reachable through a trusted proxy. It defaults to `false` and `docker-compose.yml` does not set it, so behind a proxy without it **every caller shares the proxy's address and one rate-limit bucket**: one noisy client can then lock everyone else out of the login and other throttled routes. The server logs a warning at startup when `PUBLIC_BASE_URL` is set and `TRUST_PROXY` is not.
 
 ## NIP-46 Implementation
 
@@ -206,19 +206,29 @@ connection, or "Ask me instead of refusing" on its detail page). The signer then
 2. You open that link (it needs your normal login, and 2FA if you use it) and choose **Allow once**, **Always allow** or **Deny** on the Approvals page. A badge in the navigation shows how many requests are waiting.
 3. The signer sends the client the final reply under the same request id: the signed result, or the unchanged `Permission denied for sign_event kind:N`. A request nobody answers within `ASK_APPROVAL_TTL_MS` is refused with that same text.
 
-_Allow once_ signs that one request and stores nothing. _Always allow_ stores the permission, so the next request needs no answer.
-Always allowing a login (`sign_event` kind 27235) lets that connection sign in to any site as you, including sites where signing in can delete an
-account, so the page asks you to confirm it.
+_Allow once_ signs that one request and stores nothing (and removes the pending permission row it filed, so a later "Approve all" cannot turn it into a
+permanent grant). _Always allow_ stores the permission, so the next request needs no answer.
+
+The Approvals page shows what is being asked, as plain text: for a signature the kind, the content (with its full length when cut) and **every tag with its
+first values**; for a login (kind 27235, NIP-98 HTTP auth, which is also what confirms deleting an account on many sites) the **host and path** of the
+URL it is for, the method and the payload; for an encrypt or decrypt, who it is with, the plaintext (encrypt) or the ciphertext length (decrypt).
+_Always allow_ takes a second, confirming click for any encrypt or decrypt and for kinds 5, 22242, 24133 and 27235, since each is a blanket grant.
+A card whose request has ended stays in place, greyed out, until you dismiss it, so the next card never moves under your pointer.
+
+Ask mode needs `PUBLIC_BASE_URL`: without it there is no link to send, so such a request is **refused at once** (and the "Ask me" options are switched off
+in the web UI, with the reason). A retry that carries the same request id as one still waiting shares that wait and is not sent a second `auth_url`;
+a request created before the signer started is never held (its client was already answered), so a restart does not re-ask.
 
 Only turn ask mode on for clients that understand `auth_url` (BIES and other nostr-tools based clients do). A client that does not
 will treat the interim reply as an answer or an error. Revoking, deleting or switching a connection back to refusing cancels its waiting requests.
-At most 10 requests wait per connection and 200 in total; past that, requests are refused as before. Waiting requests live in memory, so a signer
+At most 10 requests wait per connection, 50 per user and 200 in total; past that, requests are refused as before. At most 50 pending permission rows are
+kept per connection (the oldest go first). Waiting requests live in memory, so a signer
 restart refuses them (the client can ask again).
 
-| Variable              | Default  | Meaning                                                                                                                                                                                                                                                                                                                                                                |
-| --------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PUBLIC_BASE_URL`     | unset    | The origin you open the web UI at, e.g. `https://bunker.example.com` (a private or tailnet address works too). Set it for ask mode: without it the signer still holds the request (it shows on the Approvals page) but cannot build the link, so it sends the client no `auth_url` reply and the client just waits. `http(s)` only, no credentials, query or fragment. |
-| `ASK_APPROVAL_TTL_MS` | `100000` | How long a request waits for your answer, 5000 to 200000. Keep it below the client's own wait (BIES waits about 240 s).                                                                                                                                                                                                                                                |
+| Variable              | Default  | Meaning                                                                                                                                                                                                                                                                                                                                       |
+| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUBLIC_BASE_URL`     | unset    | The origin you open the web UI at, e.g. `https://bunker.example.com`. Set it for ask mode: without it there is no link to send the client, so a request it has no permission for is refused at once and ask mode cannot be turned on. `https` (plain `http` only for `localhost`, `127.0.0.1` or `[::1]`), no credentials, query or fragment. |
+| `ASK_APPROVAL_TTL_MS` | `100000` | How long a request waits for your answer, 5000 to 200000. Keep it below the client's own wait (BIES waits about 240 s).                                                                                                                                                                                                                       |
 
 ## Security
 

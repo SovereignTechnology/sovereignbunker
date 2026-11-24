@@ -186,10 +186,13 @@ export class ConnectionsController {
   async setPermissions(
     @Req() req: AuthReq,
     @Param('id') id: string,
-    @Body() body: { permissions: PermissionDescriptor[] },
+    @Body() body: { permissions?: unknown },
   ) {
+    // Validated like every other way in: an unchecked kind that does not fit the database is a 500.
+    const parsed = PermissionListSchema.safeParse(body?.permissions);
+    if (!parsed.success) throw new BadRequestException('Invalid permissions list');
     await this.connectionsService.getConnection(id, req.user.sub);
-    await this.connectionsService.setPermissions(id, body.permissions);
+    await this.connectionsService.setPermissions(id, parsed.data);
     return { success: true };
   }
 

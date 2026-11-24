@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
+import { useStore } from '@nanostores/vue';
 import {
   GATED_PERMISSION_METHODS,
   LOGIN_EVENT_KIND,
   MAX_PERMISSIONS_PER_REQUEST,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
+import { $approvalsCanAsk } from '@/stores/approvals';
 import Button from '@/components/ui/Button.vue';
 import Input from '@/components/ui/Input.vue';
 
@@ -19,6 +21,19 @@ import Input from '@/components/ui/Input.vue';
 const permissions = defineModel<PermissionDescriptor[]>('permissions', { required: true });
 /** Hold a request the connection has no permission for, instead of refusing it (approvalMode ASK). */
 const ask = defineModel<boolean>('ask', { default: false });
+
+/**
+ * False when the server has no PUBLIC_BASE_URL: it could not tell a client where to approve, so it
+ * refuses what is not granted at once. Asking is then switched off here, and cannot be switched on.
+ */
+const canAsk = useStore($approvalsCanAsk);
+watch(
+  canAsk,
+  (can) => {
+    if (!can) ask.value = false;
+  },
+  { immediate: true },
+);
 
 const newKind = ref('');
 
@@ -72,6 +87,7 @@ function addKind() {
 
 /** "Login (kind 27235)" preset: ask each time (recommended), or always allow. */
 function chooseLogin(choice: 'ask' | 'always') {
+  if (choice === 'ask' && !canAsk.value) return;
   if (choice === 'always') {
     if (!loginGranted.value) {
       permissions.value = [...permissions.value, { method: 'sign_event', kind: LOGIN_EVENT_KIND }];
@@ -213,6 +229,7 @@ function chooseLogin(choice: 'ask' | 'always') {
             name="login-choice"
             data-testid="login-ask"
             class="mt-1"
+            :disabled="!canAsk"
             :checked="loginChoice === 'ask'"
             @change="chooseLogin('ask')"
           />
@@ -252,13 +269,27 @@ function chooseLogin(choice: 'ask' | 'always') {
 
     <!-- Ask mode: hold what the connection has no permission for. -->
     <label class="flex items-start gap-2 text-sm cursor-pointer">
-      <input v-model="ask" type="checkbox" data-testid="ask-checkbox" class="mt-1" />
+      <input
+        v-model="ask"
+        type="checkbox"
+        data-testid="ask-checkbox"
+        class="mt-1"
+        :disabled="!canAsk"
+      />
       <span>
         <strong>Ask me</strong> when this app needs something it has no permission for
         <span class="block text-xs text-muted-foreground">
           The app waits while you decide on the Approvals page. Only for apps that understand a wait
           (a NIP-46 <code class="font-mono">auth_url</code> reply, as BIES does). Off: such requests
           are refused at once.
+        </span>
+        <span
+          v-if="!canAsk"
+          class="block text-xs text-destructive mt-1"
+          data-testid="ask-unavailable"
+        >
+          Not available: this server has no <code class="font-mono">PUBLIC_BASE_URL</code>, so an
+          app could not be told where to approve. Set it and restart to turn this on.
         </span>
       </span>
     </label>

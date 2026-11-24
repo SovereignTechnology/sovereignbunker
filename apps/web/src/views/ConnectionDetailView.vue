@@ -8,7 +8,9 @@ import Button from '@/components/ui/Button.vue';
 import Card from '@/components/ui/Card.vue';
 import Badge from '@/components/ui/Badge.vue';
 import PubkeyDisplay from '@/components/PubkeyDisplay.vue';
+import { useStore } from '@nanostores/vue';
 import { GATED_PERMISSION_METHODS } from '@bunker46/shared-types';
+import { $approvalsCanAsk } from '@/stores/approvals';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -163,6 +165,8 @@ async function setApprovalMode(mode: 'DENY' | 'ASK') {
   }
 }
 const modeError = ref('');
+/** False when the server has no PUBLIC_BASE_URL: asking cannot be turned on (it can be turned off). */
+const canAsk = useStore($approvalsCanAsk);
 
 // Pending requests and held requests arrive while the page is open: refetch on every activity event.
 useActivityStream(() => {
@@ -564,8 +568,9 @@ function formatTime(ts: string) {
                   data-testid="approval-mode-toggle"
                   aria-label="Ask me instead of refusing"
                   :aria-pressed="connection.approvalMode === 'ASK'"
+                  :disabled="!canAsk && connection.approvalMode !== 'ASK'"
                   :class="[
-                    'w-12 h-6 rounded-full transition-colors cursor-pointer relative shrink-0',
+                    'w-12 h-6 rounded-full transition-colors cursor-pointer relative shrink-0 disabled:opacity-50 disabled:cursor-not-allowed',
                     connection.approvalMode === 'ASK' ? 'bg-primary' : 'bg-muted',
                   ]"
                   @click="setApprovalMode(connection.approvalMode === 'ASK' ? 'DENY' : 'ASK')"
@@ -578,6 +583,14 @@ function formatTime(ts: string) {
                   />
                 </button>
               </div>
+              <p
+                v-if="!canAsk && connection.approvalMode !== 'ASK'"
+                class="text-xs text-destructive mt-1"
+                data-testid="ask-unavailable"
+              >
+                Not available: this server has no <code class="font-mono">PUBLIC_BASE_URL</code>, so
+                an app could not be told where to approve.
+              </p>
               <p v-if="modeError" class="text-xs text-destructive mt-1" role="alert">
                 {{ modeError }}
               </p>

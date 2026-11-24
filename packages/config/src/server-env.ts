@@ -50,8 +50,9 @@ export const serverEnvSchema = z
      * Public base URL of this app (e.g. `https://signer.example`), used to build the approval link
      * a held request sends its client as a NIP-46 `auth_url`: `<PUBLIC_BASE_URL>/approvals/<token>`.
      * The link opens a page behind the normal login, so it is no bearer link. Unset or empty: a held
-     * request still waits for the operator, but the client is sent no link. http(s) only, no
-     * credentials, query or fragment; a trailing slash is dropped.
+     * request is refused at once, since there is no link to send its client (ask mode needs this).
+     * https, or http for this machine only (localhost, 127.0.0.1, [::1]); no credentials, query or
+     * fragment; a trailing slash is dropped.
      */
     PUBLIC_BASE_URL: z.preprocess(
       (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
@@ -63,6 +64,15 @@ export const serverEnvSchema = z
         .refine(
           (raw) => /^https?:\/\/[^\s/?#@\\]+(?:\/[^\s?#]*)?$/i.test(raw),
           'PUBLIC_BASE_URL must be an http(s) URL without credentials, query or fragment',
+        )
+        // The link takes the operator to a login page: over plain http anyone on the path could
+        // swap it, so http is for this machine only (and a look-alike such as localhost.example
+        // does not pass).
+        .refine(
+          (raw) =>
+            /^https:\/\//i.test(raw) ||
+            /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:\/|$)/i.test(raw),
+          'PUBLIC_BASE_URL must be https (plain http only for localhost, 127.0.0.1 or [::1])',
         )
         .transform((raw) => raw.replace(/\/+$/, ''))
         .optional(),
@@ -162,6 +172,25 @@ export const serverEnvSchema = z
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
 
+/**
+ * Things worth a line in the log at startup that are not errors. Today: asking needs the operator's
+ * browser to reach this app through a proxy, and without TRUST_PROXY every caller behind that proxy
+ * shares the proxy's address, so one rate-limit bucket (one noisy client then locks out the page).
+ */
+export function deploymentWarnings(
+  env: Pick<ServerEnv, 'PUBLIC_BASE_URL' | 'TRUST_PROXY'>,
+): string[] {
+  const warnings: string[] = [];
+  if (env.PUBLIC_BASE_URL && !env.TRUST_PROXY) {
+    warnings.push(
+      'PUBLIC_BASE_URL is set but TRUST_PROXY is false: behind a reverse proxy every caller shares ' +
+        "the proxy's address and one rate-limit bucket. Set TRUST_PROXY=true if (and only if) the " +
+        'app is reachable only through that proxy.',
+    );
+  }
+  return warnings;
+}
+
 /** Nest DI token for the approval settings ({@link ServerEnv.PUBLIC_BASE_URL}, {@link ServerEnv.ASK_APPROVAL_TTL_MS}). */
 export const APPROVAL_CONFIG_INJECTION_TOKEN = 'APPROVAL_CONFIG' as const;
 
@@ -173,8 +202,3 @@ export interface ApprovalConfig {
 
 /** Nest DI token for {@link ServerEnv.NOSTR_DEFAULT_RELAYS} (effective default relay URLs). */
 export const NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN = 'NOSTR_DEFAULT_RELAYS' as const;
-
-/** TEMPORARY stub so the specs-only commit builds: its specs must fail on behaviour, not on a build error. */
-export function deploymentWarnings(_env: unknown): string[] {
-  return [];
-}

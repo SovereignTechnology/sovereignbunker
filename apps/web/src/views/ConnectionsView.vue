@@ -12,8 +12,12 @@ import Badge from '@/components/ui/Badge.vue';
 import Input from '@/components/ui/Input.vue';
 import PubkeyDisplay from '@/components/PubkeyDisplay.vue';
 import PermissionPicker from '@/components/PermissionPicker.vue';
-import { permissionsFromUri } from '@/lib/permissions';
-import { DEFAULT_CONNECTION_PERMISSIONS, type PermissionDescriptor } from '@bunker46/shared-types';
+import { splitUriPermissions } from '@/lib/permissions';
+import {
+  DEFAULT_CONNECTION_PERMISSIONS,
+  formatPermission,
+  type PermissionDescriptor,
+} from '@bunker46/shared-types';
 
 const router = useRouter();
 const route = useRoute();
@@ -102,6 +106,8 @@ const generatePerms = ref<PermissionDescriptor[]>(freshDefaults());
 const generateAsk = ref(false);
 const importPerms = ref<PermissionDescriptor[]>(freshDefaults());
 const importAsk = ref(true);
+/** What the pasted URI asked for beyond the kinds it pre-ticks: shown, never ticked. */
+const importFlagged = ref<PermissionDescriptor[]>([]);
 
 const bunkerUri = ref('');
 const uriPreviewImage = ref('');
@@ -156,9 +162,12 @@ watch(bunkerUri, (uri) => {
     const image = url.searchParams.get('image');
     if (name && !connectionName.value) connectionName.value = name;
     if (image) uriPreviewImage.value = image;
-    // Pre-select what the app asks for. It is only a starting point: the operator sees every entry
-    // in the picker below and decides what is actually granted.
-    importPerms.value = permissionsFromUri(url.searchParams.get('perms'));
+    // Pre-select the kinds the app asks for. It is only a starting point: the operator sees every
+    // entry in the picker below and decides what is actually granted. A wider ask (every kind, any
+    // encrypt or decrypt) is listed, not ticked.
+    const asked = splitUriPermissions(url.searchParams.get('perms'));
+    importPerms.value = asked.picked;
+    importFlagged.value = asked.flagged;
   } catch {
     // invalid URL, ignore
   }
@@ -203,6 +212,7 @@ function reset() {
   generateAsk.value = false;
   importPerms.value = freshDefaults();
   importAsk.value = true;
+  importFlagged.value = [];
 }
 
 function enterMode(m: 'generate' | 'import') {
@@ -455,6 +465,17 @@ function statusVariant(status: string) {
 
         <!-- What the app asked for is pre-selected; what is shown here is what gets granted. -->
         <PermissionPicker v-model:permissions="importPerms" v-model:ask="importAsk" />
+        <p
+          v-if="importFlagged.length"
+          class="rounded border border-amber-500/50 bg-amber-500/10 p-2 text-xs"
+          data-testid="uri-flagged"
+        >
+          This app also asked for
+          <span v-for="p in importFlagged" :key="formatPermission(p)" class="font-mono mr-1">{{
+            formatPermission(p)
+          }}</span>
+          . It is not ticked above: grant it there only if you want this app to have it.
+        </p>
 
         <p v-if="error" class="text-sm text-destructive">
           {{ error }}

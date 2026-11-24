@@ -386,7 +386,7 @@ describe('previewSignEvent', () => {
 
   it('cleans tag values like content: controls, bidi and invisible characters never reach the view', () => {
     const preview = previewSignEvent(
-      event({ tags: [['u', 'https://good.example/‮evil\u0000​x­y']] }),
+      event({ tags: [['u', 'https://good.example/\u202eevil\u0000\u200bx\u00ady']] }),
     )!;
     expect(preview.tags![0]!.values[0]).toBe('https://good.example/?evil??x?y');
   });
@@ -415,13 +415,13 @@ describe('previewSignEvent', () => {
   });
 
   it('removes characters that reorder or hide text: bidi overrides, zero-width, C1 and line separators', () => {
-    const evil = 'pay‮evil‬⁦x⁩​z‏\u0085  ⁠﻿end';
+    const evil = 'pay\u202eevil\u202c\u2066x\u2069\u200bz\u200f\u0085\u2028\u2029\u2060\ufeffend';
     const preview = previewSignEvent(event({ content: evil }))!;
     expect(preview.content).toBe('pay evil  x  z      end');
   });
 
   it('also removes the soft hyphen, Arabic letter mark, Hangul fillers, variation selectors and tag characters', () => {
-    const evil = 'a­b؜cᅟdᅠeㅤfﾠg️h\u{E0041}i';
+    const evil = 'a\u00adb\u061cc\u115fd\u1160e\u3164f\uffa0g\ufe0fh\u{E0041}i';
     const preview = previewSignEvent(event({ content: evil }))!;
     expect(preview.content).toBe('a b c d e f g h i');
   });
@@ -432,7 +432,7 @@ describe('previewSignEvent', () => {
   });
 
   it('cleans tag names the same way', () => {
-    const preview = previewSignEvent(event({ tags: [['p‮q', 'v']] }))!;
+    const preview = previewSignEvent(event({ tags: [['p\u202eq', 'v']] }))!;
     expect(preview.tags![0]!.name).toBe('p?q');
   });
 
@@ -487,11 +487,11 @@ describe('previewSignEvent', () => {
     });
 
     it('shows a look-alike host in its punycode form', () => {
-      expect(login('https://аpp.example/').httpAuth?.host).toMatch(/^xn--/);
+      expect(login('https://\u0430pp.example/').httpAuth?.host).toMatch(/^xn--/);
     });
 
     it('a u that is not a URL is shown as it is, cleaned, and gives no host', () => {
-      const auth = login('not a url‮')!.httpAuth!;
+      const auth = login('not a url\u202e')!.httpAuth!;
       expect(auth.host).toBeUndefined();
       expect(auth.url).toBe('not a url?');
     });
@@ -523,7 +523,7 @@ describe('previewRequest', () => {
   it.each(['nip04_encrypt', 'nip44_encrypt'])(
     '%s: the peer and the plaintext, cleaned and cut, with its length',
     (method) => {
-      const preview = previewRequest(method, [PEER, 'secret‮plan']);
+      const preview = previewRequest(method, [PEER, 'secret\u202eplan']);
       expect(preview).toEqual({
         peer: PEER,
         content: 'secret plan',
@@ -544,9 +544,9 @@ describe('previewRequest', () => {
   );
 
   it('cleans and bounds a peer value that is not a pubkey', () => {
-    const preview = previewRequest('nip44_decrypt', ['‮' + 'p'.repeat(200), 'c'])!;
+    const preview = previewRequest('nip44_decrypt', ['\u202e' + 'p'.repeat(200), 'c'])!;
     expect(preview.peer).toHaveLength(64);
-    expect(preview.peer).not.toContain('‮');
+    expect(preview.peer).not.toContain('\u202e');
   });
 
   it.each(['ping', 'connect', 'get_public_key', 'switch_relays'])('has none for %s', (method) => {

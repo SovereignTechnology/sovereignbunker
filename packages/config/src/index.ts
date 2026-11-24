@@ -1,5 +1,6 @@
 export {
   serverEnvSchema,
+  deploymentWarnings,
   type ServerEnv,
   type ApprovalConfig,
   NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN,

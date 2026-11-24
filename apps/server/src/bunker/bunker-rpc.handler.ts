@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConnectionsService } from '../connections/connections.service.js';
 import { LoggingService } from '../logging/logging.service.js';
@@ -5,13 +6,14 @@ import { EventsService } from '../events/events.service.js';
 import { EncryptionService } from '../common/crypto/encryption.service.js';
 import {
   ApprovalService,
-  previewSignEvent,
+  previewRequest,
   type ApprovalOutcome,
   type HeldRequest,
 } from './approval.service.js';
 import {
   checkPermission,
   isGatedMethod,
+  MAX_EVENT_KIND,
   parsePermissionList,
   SafeRelayUrlSchema,
   type ApprovalMode,
@@ -37,13 +39,23 @@ type PendingSecretResult = {
  */
 export type RpcReply = Nip46Response & { hold?: HeldRequest };
 
+/** A usable event kind: a whole number from 0 to 65535 (so it is also one the database can store). */
+const isEventKind = (kind: unknown): kind is number =>
+  typeof kind === 'number' && Number.isInteger(kind) && kind >= 0 && kind <= MAX_EVENT_KIND;
+
+/** What a request asks, as a hash: two events carry the same request only when this is equal. */
+const fingerprintOf = (request: Nip46Request) =>
+  createHash('sha256')
+    .update(JSON.stringify([request.method, request.params]))
+    .digest('hex');
+
 /** The permission a request needs, or undefined for a method that is not gated (or a bad event). */
 function requiredPermission(request: Nip46Request): PermissionDescriptor | undefined {
   if (!isGatedMethod(request.method)) return undefined;
   if (request.method !== 'sign_event') return { method: request.method };
   try {
     const kind = (JSON.parse(request.params[0] ?? '') as { kind?: unknown }).kind;
-    return typeof kind === 'number' ? { method: 'sign_event', kind } : undefined;
+    return isEventKind(kind) ? { method: 'sign_event', kind } : undefined;
   } catch {
     return undefined;
   }
@@ -102,8 +114,14 @@ export class BunkerRpcHandler {
      * request is then handled again from scratch (connection and permissions are loaded afresh, so a
      * connection revoked or edited during the wait is honoured), a one-time approval lifts the
      * permission check for this request only, and a refusal is not held (or filed) a second time.
+     * A refusal (`denied`, `expired`) is final: it does not look at grants made meanwhile.
      */
     resolution?: ApprovalOutcome,
+    /**
+     * False when the caller knows this request must not be held (it was made before this process
+     * started, so its client has long been answered or timed out): it is refused at once.
+     */
+    holdAllowed = true,
   ): Promise<RpcReply> {
     const start = Date.now();
     let connection = await this.connections.findByClientAndSigner(clientPubkey, signerPubkey);
@@ -126,12 +144,17 @@ export class BunkerRpcHandler {
     // Only GRANTED permissions (allowed = true) are enforced. Pending requests (allowed = false),
     // recorded when a client asks for capabilities on connect, grant nothing until the operator
     // approves them in the dashboard — so a client can never self-escalate.
-    const permissions: PermissionDescriptor[] = connection.permissions
-      .filter((p) => p.allowed)
-      .map((p) => ({
-        method: p.method as PermissionDescriptor['method'],
-        kind: p.kind ?? undefined,
-      }));
+    // A denial or a timeout is the operator's last word on THIS request: nothing granted since (in
+    // another tab, say) turns it into a signature, so no grant is consulted at all.
+    const refused = resolution === 'denied' || resolution === 'expired';
+    const permissions: PermissionDescriptor[] = refused
+      ? []
+      : connection.permissions
+          .filter((p) => p.allowed)
+          .map((p) => ({
+            method: p.method as PermissionDescriptor['method'],
+            kind: p.kind ?? undefined,
+          }));
 
     // "Approve once": the operator allowed THIS request. Applied to the in-memory list only, never
     // stored, and only for the permission this very request needs.
@@ -209,9 +232,10 @@ export class BunkerRpcHandler {
           }
           const parsed = JSON.parse(eventJson);
           // A permission request is for one kind. An event without a usable kind must not be filed
-          // as a method-level request, which approving would turn into a grant for every kind.
-          if (!Number.isInteger(parsed?.kind) || parsed.kind < 0) {
-            error = 'Invalid event: kind must be a non-negative integer';
+          // as a method-level request, which approving would turn into a grant for every kind. A kind
+          // is 16 bits (NIP-01); anything larger is also one the audit log could not store.
+          if (!isEventKind(parsed?.kind)) {
+            error = 'Invalid event: kind must be a whole number from 0 to 65535';
             break;
           }
           eventKind = parsed.kind;
@@ -331,17 +355,19 @@ export class BunkerRpcHandler {
 
       // Hold and ask: on an ASK connection the denial becomes a wait for the operator. The caller
       // tells the client to wait and answers when the hold ends. When no hold can be opened (too many
-      // are open), the request is simply denied, with the same text as ever.
-      if (connection.approvalMode === 'ASK') {
+      // are open, or the id is in use for another request), when there is no link to send the client
+      // (no PUBLIC_BASE_URL), or when the caller says this request is too old to hold, the request is
+      // simply denied, with the same text as ever.
+      if (connection.approvalMode === 'ASK' && holdAllowed && this.approvals.canAsk) {
         const hold = this.approvals.open({
           userId: connection.userId,
           connectionId: connection.id,
           connectionName: connection.name,
           clientPubkey: connection.clientPubkey,
           requestId: request.id,
+          fingerprint: fingerprintOf(request),
           permission: deniedPermission,
-          preview:
-            request.method === 'sign_event' ? previewSignEvent(request.params[0]) : undefined,
+          preview: previewRequest(request.method, request.params),
         });
         if (hold) {
           this.logger.log(

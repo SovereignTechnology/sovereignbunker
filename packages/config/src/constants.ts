@@ -52,10 +52,23 @@ export const APPROVAL_CONSTANTS = {
   TOKEN_BYTES: 24,
   /** Held requests one connection may have open at once; the next is answered as denied. */
   MAX_HOLDS_PER_CONNECTION: 10,
+  /** Held requests one user may have open at once (all their connections); below the global cap. */
+  MAX_HOLDS_PER_USER: 50,
   /** Held requests the whole signer may have open at once. */
   MAX_HOLDS_GLOBAL: 200,
+  /** Pending permission rows kept per connection; the oldest go first. */
+  MAX_PENDING_PERMISSIONS_PER_CONNECTION: 50,
   /** Event content shown to the operator is cut to this many characters. */
   PREVIEW_CONTENT_MAX: 280,
-  /** At most this many distinct tag names are shown. */
+  /** At most this many tags are shown (each with its first values). */
   PREVIEW_TAG_NAMES_MAX: 20,
+  /** Values shown per tag, and how long each may be. */
+  PREVIEW_TAG_VALUES_MAX: 3,
+  PREVIEW_TAG_VALUE_MAX: 100,
+  /** Tag names are cut to this many characters. */
+  PREVIEW_TAG_NAME_MAX: 16,
+  /** A peer pubkey is 64 hex characters; anything longer is cut. */
+  PREVIEW_PEER_MAX: 64,
+  /** The path of the URL an HTTP-auth login is for. */
+  PREVIEW_URL_PART_MAX: 200,
 } as const;

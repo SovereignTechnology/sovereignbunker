@@ -89,6 +89,12 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
   private lastHandledSweep = 0;
   /** `<signer pubkey>:<event id>` of requests being answered right now, across listener swaps. */
   private inFlight = new Set<string>();
+  /**
+   * When this process started (seconds). A request created before it is never held: relays redeliver
+   * recent events after a restart, and the client of one made before was already answered (or has
+   * given up), so holding it again would send a second `auth_url` for an id it has finished with.
+   */
+  private readonly startedAtS = Math.floor(Date.now() / 1000);
   private watchdogHandle?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -602,7 +608,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleIncomingEvent(
-    event: { pubkey: string; content: string },
+    event: { pubkey: string; content: string; created_at?: number },
     signerNsecHex: string,
     signerPubkeyHex: string,
     relays: string[],
@@ -658,7 +664,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       `NIP-46 ${parsed.data.method} from ${clientPubkey.slice(0, 12)}... (id: ${parsed.data.id})`,
     );
 
-    const reply = await this.runRpc(clientPubkey, signerPubkeyHex, parsed.data);
+    const mayHold = typeof event.created_at !== 'number' || event.created_at >= this.startedAtS;
+    const reply = await this.runRpc(clientPubkey, signerPubkeyHex, parsed.data, undefined, mayHold);
 
     if (reply.hold) {
       await this.answerHeldRequest(
@@ -683,6 +690,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     signerPubkeyHex: string,
     request: Nip46Request,
     resolution?: Parameters<BunkerRpcHandler['handleRequest']>[9],
+    holdAllowed = true,
   ): Promise<RpcReply> {
     return this.rpcHandler.handleRequest(
       clientPubkey,
@@ -706,6 +714,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       },
       (nsec) => getPublicKey(hexToBytes(nsec)),
       resolution,
+      holdAllowed,
     );
   }
 
@@ -728,7 +737,9 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     signerSecretKey: Uint8Array,
     relays: string[],
   ) {
-    const url = this.approvals.authUrl(hold.token);
+    // A retry of a request that is already held (same id) shares that hold and sends nothing here:
+    // its client has had its one interim, and a second would count as a refusal.
+    const url = hold.shared ? undefined : this.approvals.authUrl(hold.token);
     if (url) {
       await this.sendResponse(
         { id: request.id, result: 'auth_url', error: url },
@@ -736,10 +747,6 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
         clientPubkey,
         signerSecretKey,
         relays,
-      );
-    } else {
-      this.logger.warn(
-        'PUBLIC_BASE_URL is not set: holding the request without telling the client where to approve it',
       );
     }
 

@@ -1,4 +1,10 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { APPROVAL_CONSTANTS } from '@bunker46/config';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { EncryptionService } from '../common/crypto/encryption.service.js';
 import { EventsService } from '../events/events.service.js';
@@ -70,37 +76,42 @@ export class ConnectionsService {
     const key = await this.prisma.nsecKey.findFirst({ where: { id: nsecKeyId, userId } });
     if (!key) throw new NotFoundException('Key not found');
 
-    const conn = await this.prisma.bunkerConnection.create({
-      data: {
-        userId,
-        nsecKeyId,
-        clientPubkey,
-        name: data.name ?? 'Unnamed Connection',
-        logoUrl: data.logoUrl,
-        relays: data.relays ?? [],
-        secret: data.secret,
-        remotePubkey: data.remotePubkey,
-        approvalMode: data.approvalMode ?? 'DENY',
-        status: 'PENDING',
-      },
-    });
-
     // Seed the connection's granted permissions under the default-deny RPC handler. The operator's
     // explicit list wins, even when empty. Permissions a client asks for in its `connect` request are
     // not part of this seed: they are recorded as PENDING requests for the operator to approve.
     const seed = seedPermissions ?? DEFAULT_CONNECTION_PERMISSIONS;
     // A list from a caller can repeat an entry; the unique index does not collapse kind-less rows.
     const unique = [...new Map(seed.map((p) => [permKey(p), p])).values()];
-    if (unique.length > 0) {
-      await this.prisma.connectionPermission.createMany({
-        data: unique.map((p) => ({
-          connectionId: conn.id,
-          method: p.method,
-          kind: p.kind ?? null,
-          allowed: true,
-        })),
+
+    // One transaction: a seed the database refuses must not leave a connection with no permissions
+    // behind (an orphan the operator would have to find and delete).
+    const conn = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.bunkerConnection.create({
+        data: {
+          userId,
+          nsecKeyId,
+          clientPubkey,
+          name: data.name ?? 'Unnamed Connection',
+          logoUrl: data.logoUrl,
+          relays: data.relays ?? [],
+          secret: data.secret,
+          remotePubkey: data.remotePubkey,
+          approvalMode: data.approvalMode ?? 'DENY',
+          status: 'PENDING',
+        },
       });
-    }
+      if (unique.length > 0) {
+        await tx.connectionPermission.createMany({
+          data: unique.map((p) => ({
+            connectionId: created.id,
+            method: p.method,
+            kind: p.kind ?? null,
+            allowed: true,
+          })),
+        });
+      }
+      return created;
+    });
 
     await this.eventsService.publishUserActivity(userId);
 
@@ -183,7 +194,7 @@ export class ConnectionsService {
     if (permissions.length === 0) return;
     const existing = await this.prisma.connectionPermission.findMany({
       where: { connectionId },
-      select: { method: true, kind: true, allowed: true },
+      select: { id: true, method: true, kind: true, allowed: true },
     });
     const have = new Set(existing.map(permKey));
     const granted = existing
@@ -192,13 +203,26 @@ export class ConnectionsService {
         method: e.method as PermissionDescriptor['method'],
         kind: e.kind ?? undefined,
       }));
-    const fresh = permissions.filter((p) => {
-      const key = permKey(p);
-      if (have.has(key) || checkPermission(granted, p)) return false;
-      have.add(key);
-      return true;
-    });
+    const max = APPROVAL_CONSTANTS.MAX_PENDING_PERMISSIONS_PER_CONNECTION;
+    const fresh = permissions
+      .filter((p) => {
+        const key = permKey(p);
+        if (have.has(key) || checkPermission(granted, p)) return false;
+        have.add(key);
+        return true;
+      })
+      .slice(0, max);
     if (fresh.length === 0) return;
+    // Every denied request files a row, one per kind a client tries, so the table is bounded: past
+    // `max` the OLDEST pending rows make room (ids are cuids, which sort by creation time). Granted
+    // rows are never touched.
+    const pending = existing.filter((e) => !e.allowed).sort((a, b) => (a.id < b.id ? -1 : 1));
+    const drop = pending.length + fresh.length - max;
+    if (drop > 0) {
+      await this.prisma.connectionPermission.deleteMany({
+        where: { id: { in: pending.slice(0, drop).map((e) => e.id) } },
+      });
+    }
     await this.prisma.connectionPermission.createMany({
       data: fresh.map((p) => ({
         connectionId,
@@ -221,6 +245,8 @@ export class ConnectionsService {
   ) {
     const conn = await this.prisma.bunkerConnection.findUnique({ where: { id: connectionId } });
     if (!conn || conn.userId !== userId) throw new NotFoundException('Connection not found');
+    // A late "always allow" must not outlive the revoke (which also ended the holds).
+    if (conn.status === 'REVOKED') throw new ConflictException('Connection is revoked');
     if (permissions.length === 0) return;
 
     const existing = await this.prisma.connectionPermission.findMany({

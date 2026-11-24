@@ -1,5 +1,5 @@
 import { atom, computed } from 'nanostores';
-import type { PendingApprovalDto } from '@bunker46/shared-types';
+import type { PendingApprovalDto, PendingApprovalsDto } from '@bunker46/shared-types';
 import { api } from '@/lib/api';
 import { connectActivityStream } from '@/composables/useActivityStream';
 
@@ -8,11 +8,24 @@ const $approvals = atom<PendingApprovalDto[]>([]);
 /** True once the first load answered, so a page can tell "none waiting" from "not loaded yet". */
 const $approvalsLoaded = atom(false);
 const $pendingApprovalCount = computed($approvals, (list) => list.length);
+/**
+ * False when the server has no PUBLIC_BASE_URL: it has no link to send a client, so it refuses a
+ * gated request at once, and the forms should not offer to ask. True until the server says otherwise.
+ */
+const $approvalsCanAsk = atom(true);
+/** Why the last refresh failed ('' when it did not), so a page can say so instead of "Loading…". */
+const $approvalsError = atom('');
 
 /** Polling cadence: a slow safety net while the stream is up, quick when there is no stream. */
 const SAFETY_POLL_MS = 30_000;
 const FALLBACK_POLL_MS = 5_000;
 const RECONNECT_MS = 30_000;
+/**
+ * Every signing request the server handles is an activity event, and every open tab refreshes on it:
+ * a client sending `ping` in a loop must not become a request storm. Events within this window are
+ * ONE refresh, taken after the last of them.
+ */
+const ACTIVITY_DEBOUNCE_MS = 1_000;
 
 // A refresh applies only if no newer one has landed and the watch it started under is still the
 // current one, so a slow old answer can neither restore a resolved approval nor leak into the next
@@ -26,14 +39,22 @@ async function refreshApprovals(): Promise<boolean> {
   const seq = ++startedSeq;
   const startedIn = session;
   try {
-    const res = await api.get<{ approvals: PendingApprovalDto[] }>('/approvals');
+    const res = await api.get<PendingApprovalsDto>('/approvals');
     if (startedIn !== session) return false;
     if (seq < appliedSeq) return true;
     appliedSeq = seq;
     $approvals.set(res.approvals);
+    // An older server sends no flag: it could always ask.
+    $approvalsCanAsk.set(res.canAsk !== false);
+    $approvalsError.set('');
     $approvalsLoaded.set(true);
     return true;
-  } catch {
+  } catch (err) {
+    // Said, not swallowed: a 429 or an outage otherwise leaves the page on "Loading…" while the
+    // request it is about to show runs out. The list that was there is kept.
+    if (startedIn === session) {
+      $approvalsError.set(err instanceof Error ? err.message : 'Could not load the approvals');
+    }
     return false;
   }
 }
@@ -41,7 +62,16 @@ async function refreshApprovals(): Promise<boolean> {
 let stopStream: (() => void) | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let activityTimer: ReturnType<typeof setTimeout> | null = null;
 let watching = false;
+
+function refreshSoon() {
+  if (activityTimer) clearTimeout(activityTimer);
+  activityTimer = setTimeout(() => {
+    activityTimer = null;
+    if (watching) void refreshApprovals();
+  }, ACTIVITY_DEBOUNCE_MS);
+}
 
 function setPolling(ms: number) {
   if (pollTimer) clearInterval(pollTimer);
@@ -51,7 +81,7 @@ function setPolling(ms: number) {
 function connect() {
   stopStream?.();
   stopStream = connectActivityStream({
-    onActivity: () => void refreshApprovals(),
+    onActivity: refreshSoon,
     onOpen: () => {
       // Back on pushes: refresh once (events were missed while down) and poll slowly again.
       void refreshApprovals();
@@ -91,12 +121,17 @@ function stopApprovalWatch() {
   pollTimer = null;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  if (activityTimer) clearTimeout(activityTimer);
+  activityTimer = null;
   $approvals.set([]);
   $approvalsLoaded.set(false);
+  $approvalsError.set('');
 }
 
 export {
   $approvals,
+  $approvalsCanAsk,
+  $approvalsError,
   $approvalsLoaded,
   $pendingApprovalCount,
   refreshApprovals,

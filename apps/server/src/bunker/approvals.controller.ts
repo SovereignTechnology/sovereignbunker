@@ -12,8 +12,12 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
-import { ApproveApprovalBodySchema, type PermissionDescriptor } from '@bunker46/shared-types';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
+import {
+  ApproveApprovalBodySchema,
+  type PendingApprovalsDto,
+  type PermissionDescriptor,
+} from '@bunker46/shared-types';
 import type { FastifyRequest } from 'fastify';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
 import { TotpVerifiedGuard } from '../auth/guards/totp-verified.guard.js';
@@ -25,8 +29,8 @@ type AuthReq = FastifyRequest & { user: { sub: string } };
 /** A token is base64url of 24 random bytes; anything else cannot match and is refused up front. */
 const TOKEN_SHAPE = /^[A-Za-z0-9_-]{16,64}$/;
 
-// Both named throttlers apply to every route, so both are set. Reads are polled by the app header
-// (about 12 a minute at the 5 s fallback); decisions are rare, so they get a much lower ceiling.
+// Both named throttlers apply to every route, so both are set. Decisions are rare, so they get a much
+// lower ceiling than reading one request.
 const READ_LIMIT = { default: { limit: 120, ttl: 60_000 }, auth: { limit: 120, ttl: 60_000 } };
 const DECIDE_LIMIT = { default: { limit: 30, ttl: 60_000 }, auth: { limit: 30, ttl: 60_000 } };
 
@@ -47,10 +51,16 @@ export class ApprovalsController {
     private readonly connections: ConnectionsService,
   ) {}
 
+  /**
+   * Not rate-limited. The page refreshes this on every signing event (and every tab does), so a
+   * paired client sending `ping` in a loop could otherwise push the operator's own tab over a limit,
+   * and the 429 would hide a request while its hold ran out. It is an in-memory read of the caller's
+   * own holds, behind the login, so there is nothing to protect.
+   */
   @Get()
-  @Throttle(READ_LIMIT)
-  list(@Req() req: AuthReq) {
-    return { approvals: this.approvals.list(req.user.sub) };
+  @SkipThrottle({ default: true, auth: true })
+  list(@Req() req: AuthReq): PendingApprovalsDto {
+    return { approvals: this.approvals.list(req.user.sub), canAsk: this.approvals.canAsk };
   }
 
   @Get(':token')
@@ -73,13 +83,19 @@ export class ApprovalsController {
     }
     const userId = req.user.sub;
     const held = this.approvals.get(this.checkedToken(token), userId);
+    const permission = {
+      method: held.method as PermissionDescriptor['method'],
+      kind: held.kind,
+    };
 
     if (parsed.data.mode === 'always') {
       // Granted before the hold is settled: the request is handled again after the wait and must
       // find the permission already there. Owner-checked inside.
-      await this.connections.grantPermissions(held.connectionId, userId, [
-        { method: held.method as PermissionDescriptor['method'], kind: held.kind },
-      ]);
+      await this.connections.grantPermissions(held.connectionId, userId, [permission]);
+    } else {
+      // This click answers this request and nothing else: the pending row it filed goes too, or
+      // "Approve all" on the connection page would later turn a one-time yes into a permanent grant.
+      await this.connections.denyRequests(held.connectionId, userId, [permission]);
     }
     try {
       this.approvals.resolve(

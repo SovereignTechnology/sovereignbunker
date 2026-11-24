@@ -11,10 +11,14 @@ import {
   APPROVAL_CONSTANTS,
   type ApprovalConfig,
 } from '@bunker46/config';
-import type {
-  ApprovalPreviewDto,
-  PendingApprovalDto,
-  PermissionDescriptor,
+import {
+  MAX_EVENT_KIND,
+  LOGIN_EVENT_KIND,
+  type ApprovalHttpAuthPreview,
+  type ApprovalPreviewDto,
+  type ApprovalTagPreview,
+  type PendingApprovalDto,
+  type PermissionDescriptor,
 } from '@bunker46/shared-types';
 import { EventsService } from '../events/events.service.js';
 
@@ -35,6 +39,12 @@ export interface HeldRequest {
   token: string;
   /** Settles exactly once and never rejects. */
   decision: Promise<ApprovalOutcome>;
+  /**
+   * True when this is a retry of a request that is already held (the same request id on the same
+   * connection): it shares that hold's decision, and its client must NOT be sent a second `auth_url`
+   * (nostr-tools rejects the request when it gets one).
+   */
+  shared?: boolean;
 }
 
 export interface OpenApprovalInput {
@@ -44,6 +54,11 @@ export interface OpenApprovalInput {
   clientPubkey: string;
   /** The NIP-46 request id; the final reply carries the same one. */
   requestId: string;
+  /**
+   * Identifies WHAT is asked (method and parameters). A second event with the same request id shares
+   * the hold only when this matches, so approving one request can never sign another.
+   */
+  fingerprint: string;
   permission: PermissionDescriptor;
   preview?: ApprovalPreviewDto;
 }
@@ -55,28 +70,109 @@ interface Entry {
   connectionName: string;
   clientPubkey: string;
   requestId: string;
+  fingerprint: string;
   permission: PermissionDescriptor;
   preview?: ApprovalPreviewDto;
   createdAt: number;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
+  decision: Promise<ApprovalOutcome>;
   settle: (outcome: ApprovalOutcome) => void;
 }
 
 /**
- * What would garble or spoof the operator's view of the content: C0 and C1 controls, DEL, zero-width
- * and bidi-direction characters (a right-to-left override can make one text read as another), the
- * line and paragraph separators, and the byte-order mark.
+ * What would garble or spoof the operator's view of a text: C0 and C1 controls, DEL, the soft hyphen,
+ * zero-width and bidi-direction characters (a right-to-left override can make one text read as
+ * another), the line and paragraph separators, the byte-order mark, the Hangul and half-width fillers
+ * that render as blanks, the Arabic letter mark, variation selectors and the invisible tag
+ * characters. Astral ranges need the `u` flag.
  */
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
-const TAG_NAME_MAX = 16;
+const CONTROL_CHARS =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u200b-\u200f\u2028-\u202e\u2060-\u2069\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
+
+const clean = (text: string, replacement: string) => text.replace(CONTROL_CHARS, replacement);
+
+/** The first `max` characters, counted in code points: never half of a surrogate pair. */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+  // Every code point is at most two UTF-16 units, so 2 * max units hold at least `max` of them.
+  return Array.from(text.slice(0, max * 2))
+    .slice(0, max)
+    .join('');
+}
+
+/** The length in code points, without building an array of a long text. */
+function countCodePoints(text: string): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) {
+      const d = text.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) i++;
+    }
+    n++;
+  }
+  return n;
+}
+
+/** A text the operator reads (event content, a plaintext): cleaned, cut, and its full length. */
+function previewText(
+  text: string,
+): Pick<ApprovalPreviewDto, 'content' | 'contentTruncated' | 'contentLength'> {
+  const cleaned = clean(text, ' ');
+  const shown = cut(cleaned, APPROVAL_CONSTANTS.PREVIEW_CONTENT_MAX);
+  return {
+    content: shown,
+    contentTruncated: shown.length < cleaned.length,
+    contentLength: countCodePoints(cleaned),
+  };
+}
+
+/** A short text from the client (a tag name or value, a method, a peer): cleaned and cut. */
+const short = (text: string, max: number) => cut(clean(text, '?'), max);
+
+/**
+ * What kind 27235 (NIP-98 HTTP auth) signs for. The operator cannot tell one login from another by
+ * the kind, and an account deletion is confirmed with the very same kind, so the URL it is for is
+ * what matters. Read with a URL parser, so `https://trusted.example@evil.example/` shows evil.example
+ * and a look-alike domain shows its punycode form.
+ */
+function previewHttpAuth(tags: unknown[]): ApprovalHttpAuthPreview | undefined {
+  const first = (name: string): string | undefined => {
+    for (const tag of tags) {
+      if (Array.isArray(tag) && tag[0] === name && typeof tag[1] === 'string') return tag[1];
+    }
+    return undefined;
+  };
+  const out: ApprovalHttpAuthPreview = {};
+  const u = first('u');
+  if (u !== undefined) {
+    try {
+      const url = new URL(u);
+      if (url.host) {
+        out.host = short(url.host, APPROVAL_CONSTANTS.PREVIEW_URL_PART_MAX);
+        out.path = short(url.pathname + url.search, APPROVAL_CONSTANTS.PREVIEW_URL_PART_MAX);
+      } else {
+        out.url = short(u, APPROVAL_CONSTANTS.PREVIEW_URL_PART_MAX);
+      }
+    } catch {
+      out.url = short(u, APPROVAL_CONSTANTS.PREVIEW_URL_PART_MAX);
+    }
+  }
+  const method = first('method');
+  if (method !== undefined) out.method = short(method, APPROVAL_CONSTANTS.PREVIEW_TAG_NAME_MAX);
+  const payload = first('payload');
+  if (payload !== undefined) out.payload = short(payload, APPROVAL_CONSTANTS.PREVIEW_TAG_VALUE_MAX);
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /**
  * What the operator is shown about a `sign_event` request: the kind, the content (controls removed,
- * cut short) and the tag names. Never the whole event, never tag values, and never anything the
- * client could use to inject markup (the web view renders it as text). Returns undefined for an
- * event that does not parse; the hold itself does not depend on a preview.
+ * cut short, with its full length), and every tag with its name and first values. For kind 27235 also
+ * what the login is for. Never the whole event, and never anything the client could use to inject
+ * markup (the web view renders it as text). Returns undefined for an event that does not parse; the
+ * hold itself does not depend on a preview.
  */
 export function previewSignEvent(eventJson: string | undefined): ApprovalPreviewDto | undefined {
   if (!eventJson) return undefined;
@@ -90,22 +186,72 @@ export function previewSignEvent(eventJson: string | undefined): ApprovalPreview
   const { kind, content, tags } = event as { kind?: unknown; content?: unknown; tags?: unknown };
 
   const preview: ApprovalPreviewDto = {};
-  if (typeof kind === 'number' && Number.isInteger(kind) && kind >= 0) preview.kind = kind;
-  if (typeof content === 'string') {
-    const clean = content.replace(CONTROL_CHARS, ' ');
-    preview.content = clean.slice(0, APPROVAL_CONSTANTS.PREVIEW_CONTENT_MAX);
-    preview.contentTruncated = clean.length > APPROVAL_CONSTANTS.PREVIEW_CONTENT_MAX;
+  if (typeof kind === 'number' && Number.isInteger(kind) && kind >= 0 && kind <= MAX_EVENT_KIND) {
+    preview.kind = kind;
   }
+  if (typeof content === 'string') Object.assign(preview, previewText(content));
   if (Array.isArray(tags)) {
-    const names = new Set<string>();
+    const shown: ApprovalTagPreview[] = [];
+    let count = 0;
     for (const tag of tags) {
       if (!Array.isArray(tag) || typeof tag[0] !== 'string') continue;
-      names.add(tag[0].replace(CONTROL_CHARS, '?').slice(0, TAG_NAME_MAX));
-      if (names.size >= APPROVAL_CONSTANTS.PREVIEW_TAG_NAMES_MAX) break;
+      count++;
+      if (shown.length >= APPROVAL_CONSTANTS.PREVIEW_TAG_NAMES_MAX) continue;
+      shown.push({
+        name: short(tag[0], APPROVAL_CONSTANTS.PREVIEW_TAG_NAME_MAX),
+        values: tag
+          .slice(1)
+          .filter((v): v is string => typeof v === 'string')
+          .slice(0, APPROVAL_CONSTANTS.PREVIEW_TAG_VALUES_MAX)
+          .map((v) => short(v, APPROVAL_CONSTANTS.PREVIEW_TAG_VALUE_MAX)),
+      });
     }
-    preview.tagNames = [...names];
+    preview.tags = shown;
+    preview.tagCount = count;
+    if (preview.kind === LOGIN_EVENT_KIND) {
+      const httpAuth = previewHttpAuth(tags);
+      if (httpAuth) preview.httpAuth = httpAuth;
+    }
   }
   return preview;
+}
+
+/**
+ * What the operator is shown about an encrypt or decrypt request: who it is with, and for an encrypt
+ * the plaintext, for a decrypt only how long the ciphertext is (it means nothing to read, and the
+ * plaintext is what the client is after).
+ */
+function previewCrypto(
+  method: 'encrypt' | 'decrypt',
+  params: readonly string[],
+): ApprovalPreviewDto | undefined {
+  const [peer, payload] = params;
+  if (typeof peer !== 'string') return undefined;
+  const preview: ApprovalPreviewDto = { peer: short(peer, APPROVAL_CONSTANTS.PREVIEW_PEER_MAX) };
+  if (typeof payload === 'string') {
+    if (method === 'encrypt') Object.assign(preview, previewText(payload));
+    else preview.ciphertextLength = payload.length;
+  }
+  return preview;
+}
+
+/** What to show for a held request of this method, or undefined when there is nothing to show. */
+export function previewRequest(
+  method: string,
+  params: readonly string[],
+): ApprovalPreviewDto | undefined {
+  switch (method) {
+    case 'sign_event':
+      return previewSignEvent(params[0]);
+    case 'nip04_encrypt':
+    case 'nip44_encrypt':
+      return previewCrypto('encrypt', params);
+    case 'nip04_decrypt':
+    case 'nip44_decrypt':
+      return previewCrypto('decrypt', params);
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -132,18 +278,52 @@ export class ApprovalService implements OnModuleDestroy {
   }
 
   /**
-   * Hold a request. Returns undefined when a cap is reached (per connection, then globally): the
-   * caller answers such a request as denied, so a connected client cannot make the signer remember
-   * an unbounded number of waits.
+   * Whether anything can be asked at all. Without a PUBLIC_BASE_URL there is no link to send the
+   * client, so it would wait in silence and then be refused: the signer refuses it at once instead.
+   */
+  get canAsk(): boolean {
+    return Boolean(this.config.publicBaseUrl);
+  }
+
+  /**
+   * Hold a request. Returns undefined when it must not be held: a cap is reached (per connection,
+   * per user, then globally), so a connected client cannot make the signer remember an unbounded
+   * number of waits, or the request id is already in use for something else. The caller answers
+   * such a request as denied.
+   *
+   * A second event with the same request id on the same connection (a client retry, a relay
+   * redelivery) for the SAME request shares the first hold: one decision, and its client is not sent
+   * a second `auth_url`.
    */
   open(input: OpenApprovalInput): HeldRequest | undefined {
+    for (const e of this.entries.values()) {
+      if (e.connectionId !== input.connectionId || e.requestId !== input.requestId) continue;
+      if (
+        e.fingerprint === input.fingerprint &&
+        e.permission.method === input.permission.method &&
+        e.permission.kind === input.permission.kind
+      ) {
+        return { token: e.token, decision: e.decision, shared: true };
+      }
+      // The same id for another request: sharing would let approving one sign the other.
+      this.logger.warn(
+        `Request id ${input.requestId.slice(0, 8)} is held for another request on connection ${input.connectionId}; refusing to hold this one`,
+      );
+      return undefined;
+    }
     if (this.entries.size >= APPROVAL_CONSTANTS.MAX_HOLDS_GLOBAL) {
       this.logger.warn('Too many held requests overall; refusing to hold another');
       return undefined;
     }
     let forConnection = 0;
+    let forUser = 0;
     for (const e of this.entries.values()) {
       if (e.connectionId === input.connectionId) forConnection++;
+      if (e.userId === input.userId) forUser++;
+    }
+    if (forUser >= APPROVAL_CONSTANTS.MAX_HOLDS_PER_USER) {
+      this.logger.warn(`Too many held requests for user ${input.userId}; refusing to hold another`);
+      return undefined;
     }
     if (forConnection >= APPROVAL_CONSTANTS.MAX_HOLDS_PER_CONNECTION) {
       this.logger.warn(
@@ -168,11 +348,13 @@ export class ApprovalService implements OnModuleDestroy {
       connectionName: input.connectionName,
       clientPubkey: input.clientPubkey,
       requestId: input.requestId,
+      fingerprint: input.fingerprint,
       permission: input.permission,
       preview: input.preview,
       createdAt: now,
       expiresAt: now + this.config.ttlMs,
       timer: setTimeout(() => this.finish(token, 'expired'), this.config.ttlMs),
+      decision,
       settle,
     };
     // A pending hold must not keep the process alive on its own.

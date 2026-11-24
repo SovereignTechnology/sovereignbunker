@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import { Nip46Method } from './nip46.js';
 
+/**
+ * The last event kind there is: NIP-01 makes a kind a 16-bit integer. Also well inside the database's
+ * 32-bit column, so a stored kind can never fail to insert (which would drop an audit row).
+ */
+export const MAX_EVENT_KIND = 65535;
+
 export const PermissionDescriptorSchema = z.object({
   method: Nip46Method,
-  kind: z.number().int().nonnegative().optional(),
+  kind: z.number().int().min(0).max(MAX_EVENT_KIND).optional(),
 });
 export type PermissionDescriptor = z.infer<typeof PermissionDescriptorSchema>;
 
@@ -27,10 +33,13 @@ export const DEFAULT_CONNECTION_PERMISSIONS: readonly PermissionDescriptor[] = [
 export function parsePermissionString(perm: string): PermissionDescriptor {
   const [method, kindStr] = perm.split(':');
   const parsed = Nip46Method.parse(method);
-  return {
-    method: parsed,
-    kind: kindStr ? parseInt(kindStr, 10) : undefined,
-  };
+  if (!kindStr) return { method: parsed, kind: undefined };
+  // Digits only, in range: "abc", "-4", "1.5" and "3000000000" are refused here (and skipped by
+  // parsePermissionList) instead of becoming NaN or a kind that cannot be signed or stored.
+  if (!/^\d{1,5}$/.test(kindStr) || Number(kindStr) > MAX_EVENT_KIND) {
+    throw new Error(`Invalid event kind in permission: ${kindStr.slice(0, 12)}`);
+  }
+  return { method: parsed, kind: Number(kindStr) };
 }
 
 export function formatPermission(perm: PermissionDescriptor): string {
