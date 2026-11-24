@@ -196,6 +196,55 @@ describe('BunkerRpcHandler', () => {
     });
   });
 
+  describe('switch_relays', () => {
+    const BASE = ['wss://base-one.example.com', 'wss://base-two.example.com'];
+
+    function connectionWithRelays(relays: string[]) {
+      return { ...makeConnection([]), relays };
+    }
+
+    it("answers a bunker:// session (no stored relays) with the owner's relay set", async () => {
+      const lookup = vi.fn().mockResolvedValue(BASE);
+      handler.setBaseRelayLookup(lookup);
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        connectionWithRelays([]) as never,
+      );
+      const res = await handle(request('switch_relays'));
+      expect(lookup).toHaveBeenCalledWith('user-1');
+      expect(res.error).toBeUndefined();
+      expect(JSON.parse(res.result!)).toEqual(BASE);
+    });
+
+    it("answers a session with its own relays with those plus the owner's, once each", async () => {
+      handler.setBaseRelayLookup(vi.fn().mockResolvedValue(BASE));
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        connectionWithRelays(['wss://relay.example.com', BASE[1]]) as never,
+      );
+      const res = await handle(request('switch_relays'));
+      expect(JSON.parse(res.result!)).toEqual(['wss://relay.example.com', BASE[1], BASE[0]]);
+    });
+
+    it('never hands a client an unsafe relay URL', async () => {
+      handler.setBaseRelayLookup(
+        vi.fn().mockResolvedValue(['ws://plain.example.com', 'wss://127.0.0.1', BASE[0]]),
+      );
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        connectionWithRelays(['wss://localhost']) as never,
+      );
+      const res = await handle(request('switch_relays'));
+      expect(JSON.parse(res.result!)).toEqual([BASE[0]]);
+    });
+
+    it('answers null when there is no relay to offer', async () => {
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        connectionWithRelays([]) as never,
+      );
+      const res = await handle(request('switch_relays'));
+      expect(res.result).toBe('null');
+      expect(res.error).toBeUndefined();
+    });
+  });
+
   describe('connect handshake', () => {
     it('activates a PENDING connection and echoes the secret the client presented', async () => {
       vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(

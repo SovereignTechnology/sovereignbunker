@@ -74,6 +74,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     this.rpcHandler.setPendingSecretLookup((signerPubkey, secret) => {
       return this.consumePendingSecret(signerPubkey, secret);
     });
+    this.rpcHandler.setBaseRelayLookup((userId) => this.getBaseRelayUrlsForUser(userId));
 
     await this.resumeAllListeners();
     this.startConnectionWatchdog();
