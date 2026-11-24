@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
 import * as nip44 from 'nostr-tools/nip44';
-import { bytesToHex } from '@noble/hashes/utils.js';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { NOSTR_CONSTANTS } from '@bunker46/config';
 import { BunkerService } from './bunker.service.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
@@ -94,6 +94,40 @@ describe('BunkerService', () => {
       service.registerPendingSecret(pubkey, secret, info);
       // The connect handler reads these back to seed the auto-created connection's granted permissions.
       expect(service.consumePendingSecret(pubkey, secret)).toEqual(info);
+    });
+  });
+
+  describe('starting the listeners at boot', () => {
+    it('keeps going when one key cannot be started', async () => {
+      const poolModule = await import('nostr-tools/pool');
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe: vi.fn().mockReturnValue({ close: vi.fn() }),
+          close: vi.fn(),
+          publish: vi.fn().mockReturnValue([]),
+          listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
+        };
+      });
+      vi.mocked(prisma.nsecKey!.findMany).mockResolvedValueOnce([
+        { userId: 'u1', publicKey: 'a'.repeat(64), encryptedNsec: 'unreadable', connections: [] },
+        { userId: 'u1', publicKey: 'd'.repeat(64), encryptedNsec: 'readable', connections: [] },
+      ] as never);
+      vi.mocked(encryption.decrypt!).mockImplementation((value: string) => {
+        if (value === 'unreadable') throw new Error('bad ciphertext');
+        return 'e'.repeat(64);
+      });
+      const svc = new BunkerService(
+        rpcHandler as BunkerRpcHandler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      );
+
+      await svc.onModuleInit();
+
+      expect(svc.isListening('a'.repeat(64))).toBe(false);
+      expect(svc.isListening('d'.repeat(64))).toBe(true);
+      await svc.onModuleDestroy();
     });
   });
 
@@ -224,7 +258,16 @@ describe('BunkerService', () => {
   });
 
   describe('replay guard', () => {
-    type OnEvent = (event: { id: string; pubkey: string; content: string }) => Promise<void>;
+    type OnEvent = (event: {
+      id: string;
+      pubkey: string;
+      content: string;
+      created_at: number;
+    }) => Promise<void>;
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
 
     async function makeService() {
       const poolModule = await import('nostr-tools/pool');
@@ -246,15 +289,25 @@ describe('BunkerService', () => {
       );
       await svc.onModuleInit();
       // Count the requests that reach the decrypt-and-answer path without running it.
-      const internals = svc as unknown as { handleIncomingEvent: () => Promise<void> };
+      // true: the event was a request that got answered (what the guard remembers).
+      const internals = svc as unknown as { handleIncomingEvent: () => Promise<boolean> };
       const handle = vi.spyOn(internals, 'handleIncomingEvent');
-      handle.mockResolvedValue(undefined);
+      handle.mockResolvedValue(true);
       const onEventOfCall = (n: number) =>
         (subscribe.mock.calls[n]?.[2] as { onevent: OnEvent }).onevent;
-      return { svc, subscribe, handle, onEventOfCall };
+      const handled = () =>
+        (svc as unknown as { handledEventIds: Map<string, number> }).handledEventIds;
+      return { svc, subscribe, handle, onEventOfCall, handled };
     }
 
-    const request = (id: string) => ({ id, pubkey: 'c'.repeat(64), content: 'ciphertext' });
+    // `ageS` seconds old (negative: dated that far ahead).
+    const request = (id: string, ageS = 0) => ({
+      id,
+      pubkey: 'c'.repeat(64),
+      content: 'ciphertext',
+      created_at: Math.floor(Date.now() / 1000) - ageS,
+    });
+    const LISTEN = ['wss://relay.example.com'];
 
     it('only asks relays for requests inside the since window', async () => {
       const { svc, subscribe } = await makeService();
@@ -299,12 +352,157 @@ describe('BunkerService', () => {
 
       await svc.onModuleDestroy();
     });
+
+    it('ignores a request dated outside the accepted window', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      const W = NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S;
+      const AHEAD = NOSTR_CONSTANTS.NIP46_FUTURE_SKEW_S;
+
+      await onevent(request('5'.repeat(64), W + 5));
+      await onevent(request('6'.repeat(64), -(AHEAD + 5)));
+      expect(handle).not.toHaveBeenCalled();
+
+      await onevent(request('7'.repeat(64), W - 5));
+      await onevent(request('8'.repeat(64), -(AHEAD - 5)));
+      expect(handle).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('keeps a handled id for as long as its event can still be accepted', async () => {
+      // A subscription opened long ago still accepts everything newer than its fixed `since`, so
+      // the guard must not forget an id before the age gate would drop its event.
+      vi.useFakeTimers();
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      const W = NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S;
+      const event = request('9'.repeat(64));
+      await onevent(event);
+
+      vi.setSystemTime((event.created_at + W - 1) * 1000); // the last second the gate accepts it
+      await onevent(event);
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime((event.created_at + W + 1) * 1000); // now the gate drops it
+      await onevent(event);
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('forgets ids once their event could no longer be accepted', async () => {
+      vi.useFakeTimers();
+      const { svc, onEventOfCall, handled } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      const old = request('a1'.padEnd(64, '0'));
+      await onevent(old);
+      expect(handled().size).toBe(1);
+
+      const later =
+        (old.created_at +
+          NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S +
+          NOSTR_CONSTANTS.NIP46_HANDLED_MARGIN_S +
+          31) *
+        1000;
+      vi.setSystemTime(later);
+      await onevent(request('a2'.padEnd(64, '0')));
+      expect(handled().size).toBe(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('remembers a request per signer: two signers can be sent the same event', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      svc.startListeningForKey('d'.repeat(64), 'e'.repeat(64), LISTEN);
+      const event = request('b1'.padEnd(64, '0'));
+
+      await onEventOfCall(0)(event);
+      await onEventOfCall(1)(event);
+      expect(handle).toHaveBeenCalledTimes(2);
+
+      await onEventOfCall(0)(event);
+      await onEventOfCall(1)(event);
+      expect(handle).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('remembers neither an event that was not a request nor one whose handling failed', async () => {
+      const { svc, handle, onEventOfCall, handled } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+
+      handle.mockResolvedValueOnce(false); // undecryptable junk: no slot taken
+      await onevent(request('c1'.padEnd(64, '0')));
+      expect(handled().size).toBe(0);
+      await onevent(request('c1'.padEnd(64, '0'))); // tried again, now answered
+      expect(handle).toHaveBeenCalledTimes(2);
+      expect(handled().size).toBe(1);
+
+      handle.mockRejectedValueOnce(new Error('database unavailable')); // retried on redelivery
+      await onevent(request('c2'.padEnd(64, '0')));
+      await onevent(request('c2'.padEnd(64, '0')));
+      expect(handle).toHaveBeenCalledTimes(4);
+      await onevent(request('c2'.padEnd(64, '0')));
+      expect(handle).toHaveBeenCalledTimes(4);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('handles a request once when two relays deliver it at the same moment', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      let release = () => {};
+      handle.mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            release = () => resolve(true);
+          }),
+      );
+      const event = request('d1'.padEnd(64, '0'));
+
+      const first = onevent(event);
+      await onevent(event); // a second relay's copy, while the first is still being answered
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      release();
+      await first;
+      await onevent(event);
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('stays bounded: past the cap the oldest ids go first', async () => {
+      const { svc, handle, onEventOfCall, handled } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      const MAX = NOSTR_CONSTANTS.NIP46_HANDLED_EVENT_IDS_MAX;
+      const id = (n: number) => n.toString(16).padStart(64, '0');
+
+      for (let n = 0; n <= MAX; n++) await onevent(request(id(n)));
+      expect(handled().size).toBe(MAX);
+      expect(handle).toHaveBeenCalledTimes(MAX + 1);
+
+      await onevent(request(id(MAX))); // the newest is still remembered
+      expect(handle).toHaveBeenCalledTimes(MAX + 1);
+      await onevent(request(id(0))); // the oldest was forgotten
+      expect(handle).toHaveBeenCalledTimes(MAX + 2);
+
+      await svc.onModuleDestroy();
+    });
   });
 
   describe('per-relay subscriptions', () => {
     type Params = {
       onclose: (reasons: { url: string; reason: string }[]) => void;
-      oneose: () => void;
+      oneose?: () => void;
     };
     const PK = 'a'.repeat(64);
     const NSEC = 'b'.repeat(64);
@@ -312,7 +510,12 @@ describe('BunkerService', () => {
 
     async function makeService(status = new Map<string, boolean>()) {
       const poolModule = await import('nostr-tools/pool');
-      const subscribe = vi.fn().mockImplementation(() => ({ close: vi.fn() }));
+      const closers: ReturnType<typeof vi.fn>[] = [];
+      const subscribe = vi.fn().mockImplementation(() => {
+        const close = vi.fn();
+        closers.push(close);
+        return { close };
+      });
       vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
         return {
           subscribe,
@@ -330,10 +533,16 @@ describe('BunkerService', () => {
       await svc.onModuleInit();
       const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
       const paramsOf = (n: number) => subscribe.mock.calls[n]?.[2] as Params;
-      return { svc, subscribe, relaysOf, paramsOf };
+      return { svc, subscribe, relaysOf, paramsOf, closers };
     }
 
+    // Jitter off: Math.random() = 0.5 leaves every delay exactly as configured.
+    let random: { mockReturnValue(v: number): unknown; mockRestore(): void };
+    beforeEach(() => {
+      random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    });
     afterEach(() => {
+      random.mockRestore();
       vi.useRealTimers();
     });
 
@@ -379,6 +588,104 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
+    it('backs off 5, 15, 30, then 60 s although a closing subscription reports EOSE first', async () => {
+      // nostr-tools settles the EOSE of a subscription its relay closed just before onclose, so a
+      // reset on EOSE kept every retry at 5 s (and every listener retrying on the same tick).
+      vi.useFakeTimers();
+      const { svc, subscribe, paramsOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, ['wss://r1.example.com']);
+
+      let call = 0;
+      for (const wait of [5_000, 15_000, 30_000, 60_000, 60_000]) {
+        paramsOf(call).oneose?.();
+        paramsOf(call).onclose([
+          { url: 'wss://r1.example.com/', reason: 'error: too many subscriptions' },
+        ]);
+        await vi.advanceTimersByTimeAsync(wait - 1);
+        expect(subscribe).toHaveBeenCalledTimes(call + 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(subscribe).toHaveBeenCalledTimes(call + 2);
+        call += 1;
+      }
+
+      await svc.onModuleDestroy();
+    });
+
+    it('starts the backoff over once a subscription stayed open for a minute', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, paramsOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, ['wss://r1.example.com']);
+      const closed = [{ url: 'wss://r1.example.com/', reason: 'error: shutting down' }];
+
+      paramsOf(0).onclose(closed);
+      await vi.advanceTimersByTimeAsync(5_000); // call 1 opens
+      paramsOf(1).onclose(closed);
+      await vi.advanceTimersByTimeAsync(15_000); // call 2 opens, after the second step
+      expect(subscribe).toHaveBeenCalledTimes(3);
+
+      await vi.advanceTimersByTimeAsync(60_000); // call 2 stays open
+      paramsOf(2).onclose(closed);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(subscribe).toHaveBeenCalledTimes(4);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('spreads retries by up to 20% either way', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, paramsOf, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, two);
+      const closed = (url: string) => [{ url, reason: 'error: too many subscriptions' }];
+
+      random.mockReturnValue(0);
+      paramsOf(0).onclose(closed('wss://r1.example.com/'));
+      random.mockReturnValue(1);
+      paramsOf(1).onclose(closed('wss://r2.example.com/'));
+
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(subscribe).toHaveBeenCalledTimes(3);
+      expect(relaysOf(2)).toEqual(['wss://r1.example.com']);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(subscribe).toHaveBeenCalledTimes(4);
+      expect(relaysOf(3)).toEqual(['wss://r2.example.com']);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('leaves a relay on its backoff when the watchdog finds its connection dropped', async () => {
+      vi.useFakeTimers();
+      // No connection status: every relay reads as dropped to the watchdog.
+      const { svc, subscribe, paramsOf, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, two);
+      paramsOf(0).onclose([
+        { url: 'wss://r1.example.com/', reason: 'error: too many subscriptions' },
+      ]);
+
+      (svc as unknown as { checkConnections(): void }).checkConnections();
+      expect(subscribe).toHaveBeenCalledTimes(3);
+      expect(relaysOf(2)).toEqual(['wss://r2.example.com']);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(subscribe).toHaveBeenCalledTimes(4);
+      expect(relaysOf(3)).toEqual(['wss://r1.example.com']);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('closes the old subscription when the watchdog opens a new one', async () => {
+      const status = new Map([['wss://r2.example.com/', true]]);
+      const { svc, closers } = await makeService(status);
+      svc.startListeningForKey(PK, NSEC, two);
+
+      (svc as unknown as { checkConnections(): void }).checkConnections();
+
+      expect(closers[0]).toHaveBeenCalledTimes(1); // r1's, replaced
+      expect(closers[1]).not.toHaveBeenCalled(); // r2's stays
+      expect(closers[2]).not.toHaveBeenCalled(); // the new one
+
+      await svc.onModuleDestroy();
+    });
+
     it('re-opens only the relay whose connection dropped', async () => {
       const status = new Map([['wss://r2.example.com/', true]]);
       const { svc, subscribe, relaysOf } = await makeService(status);
@@ -393,7 +700,7 @@ describe('BunkerService', () => {
   });
 
   describe('self-ping liveness', () => {
-    type Event = { id: string; pubkey: string; content: string };
+    type Event = { id: string; pubkey: string; content: string; created_at: number };
     type OnEvent = (event: Event) => Promise<void> | void;
     const PK = 'a'.repeat(64);
     const NSEC = 'b'.repeat(64);
@@ -431,15 +738,21 @@ describe('BunkerService', () => {
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
       );
       await svc.onModuleInit();
-      const internals = svc as unknown as { handleIncomingEvent: () => Promise<void> };
-      const handle = vi.spyOn(internals, 'handleIncomingEvent').mockResolvedValue(undefined);
+      const internals = svc as unknown as { handleIncomingEvent: () => Promise<boolean> };
+      const handle = vi.spyOn(internals, 'handleIncomingEvent').mockResolvedValue(true);
       const onEventOf = (n: number) =>
         (subscribe.mock.calls[n]?.[2] as { onevent: OnEvent }).onevent;
       const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
       return { svc, subscribe, published, handle, onEventOf, relaysOf };
     }
 
+    // Jitter off: Math.random() = 0.5 leaves every delay exactly as configured.
+    let random: { mockRestore(): void };
+    beforeEach(() => {
+      random = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    });
     afterEach(() => {
+      random.mockRestore();
       vi.useRealTimers();
     });
 
@@ -456,7 +769,12 @@ describe('BunkerService', () => {
       await onEventOf(1)(toR2!);
       expect(handle).not.toHaveBeenCalled();
 
-      await onEventOf(0)({ id: '4'.repeat(64), pubkey: 'c'.repeat(64), content: 'ciphertext' });
+      await onEventOf(0)({
+        id: '4'.repeat(64),
+        pubkey: 'c'.repeat(64),
+        content: 'ciphertext',
+        created_at: Math.floor(Date.now() / 1000),
+      });
       expect(handle).toHaveBeenCalledTimes(1);
 
       await vi.advanceTimersByTimeAsync(WAIT);
@@ -516,14 +834,92 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
-    it('stops pinging once the listener is stopped', async () => {
+    it('stops pinging once the listener is stopped, leaving no timer behind', async () => {
       vi.useFakeTimers();
       const { svc, published } = await makeService();
+      const before = vi.getTimerCount(); // the watchdog's
       svc.startListeningForKey(PK, NSEC, [R1]);
+      expect(vi.getTimerCount()).toBeGreaterThan(before);
       svc.stopListeningForKey(PK);
+      expect(vi.getTimerCount()).toBe(before);
 
       await vi.advanceTimersByTimeAsync(FIRST + EVERY);
       expect(published).toHaveLength(0);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('signs its pings with a throwaway key: one distinct event per relay', async () => {
+      // Same author, kind, tags and second would give every relay of a round the same id.
+      vi.useFakeTimers();
+      const { svc, published } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1, R2]);
+      await vi.advanceTimersByTimeAsync(FIRST);
+
+      const [a, b] = published.map((p) => p.event as unknown as Parameters<typeof verifyEvent>[0]);
+      expect(a!.id).not.toBe(b!.id);
+      expect(a!.pubkey).toBe(b!.pubkey);
+      expect(a!.pubkey).not.toBe(PK);
+      expect(a!.pubkey).not.toBe(getPublicKey(hexToBytes(NSEC)));
+      expect(verifyEvent(a!)).toBe(true);
+      expect(a!.tags).toEqual([['p', PK]]);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('recognises the echo of every relay of a round, not only the last one', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, published, onEventOf, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1, R2]);
+      await vi.advanceTimersByTimeAsync(FIRST);
+      await onEventOf(0)(published[0]!.event);
+      await onEventOf(1)(published[1]!.event);
+      await vi.advanceTimersByTimeAsync(WAIT);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      // Both relays have echoed, so one that then goes quiet is noticed; r2 keeps echoing.
+      await vi.advanceTimersByTimeAsync(EVERY - WAIT); // round 2
+      await onEventOf(1)(published[3]!.event);
+      await vi.advanceTimersByTimeAsync(WAIT);
+      await vi.advanceTimersByTimeAsync(EVERY - WAIT); // round 3
+      await onEventOf(1)(published[5]!.event);
+      await vi.advanceTimersByTimeAsync(WAIT);
+
+      expect(subscribe).toHaveBeenCalledTimes(3);
+      expect(relaysOf(2)).toEqual([R1]);
+
+      await svc.onModuleDestroy();
+    });
+
+    it("does not take another relay's copy of a ping for an echo", async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, published, onEventOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1, R2]);
+      await vi.advanceTimersByTimeAsync(FIRST);
+      await onEventOf(1)(published[0]!.event); // r1's ping, copied to r2's subscription
+
+      // r1 never echoed on its own subscription, so silence from it proves nothing.
+      await vi.advanceTimersByTimeAsync(4 * EVERY + WAIT);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('needs two misses IN A ROW: an echo in between starts the count over', async () => {
+      vi.useFakeTimers();
+      const { svc, subscribe, published, onEventOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1]);
+      await vi.advanceTimersByTimeAsync(FIRST);
+      await onEventOf(0)(published[0]!.event);
+
+      await vi.advanceTimersByTimeAsync(EVERY + WAIT + 1); // round 2 unanswered: 1 miss
+      await vi.advanceTimersByTimeAsync(EVERY - WAIT - 1); // round 3 starts
+      await onEventOf(0)(published[2]!.event); // answered: count back to 0
+      await vi.advanceTimersByTimeAsync(EVERY + WAIT + 1); // round 4 unanswered: 1 miss
+      expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(EVERY); // round 5 unanswered: 2 in a row
+      expect(subscribe).toHaveBeenCalledTimes(2);
 
       await svc.onModuleDestroy();
     });
