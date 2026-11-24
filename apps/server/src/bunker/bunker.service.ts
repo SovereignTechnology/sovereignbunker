@@ -6,6 +6,7 @@ import {
   type OnModuleDestroy,
 } from '@nestjs/common';
 import { SimplePool } from 'nostr-tools/pool';
+import type { Filter } from 'nostr-tools/filter';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils.js';
 import * as nip44 from 'nostr-tools/nip44';
@@ -81,6 +82,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
   /** Replay guard: `<signer pubkey>:<event id>` -> when the guard may forget it (ms), oldest first. */
   private handledEventIds = new Map<string, number>();
   private lastHandledSweep = 0;
+  /** `<signer pubkey>:<event id>` of requests being answered right now, across listener swaps. */
+  private inFlight = new Set<string>();
   private watchdogHandle?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -145,15 +148,22 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
     const status = this.pool.listConnectionStatus();
     for (const [pubkey, listener] of this.activeListeners) {
-      const dead = listener.relays.filter((url) => status.get(normalizeURL(url)) !== true);
-      if (dead.length === 0) continue;
+      // One listener failing must not stop the others (an uncaught throw here is fatal).
+      try {
+        const dead = listener.relays.filter((url) => status.get(normalizeURL(url)) !== true);
+        if (dead.length === 0) continue;
 
-      this.logger.warn(
-        `Relay(s) disconnected for ${pubkey.slice(0, 12)}...: ${dead.join(', ')} – re-subscribing`,
-      );
-      // Only the dropped relays. Rebuilding every relay's subscription on each drop churned the
-      // healthy relays (one flapping relay re-subscribed all of them every few minutes).
-      for (const url of dead) listener.reopen(url);
+        this.logger.warn(
+          `Relay(s) disconnected for ${pubkey.slice(0, 12)}...: ${dead.join(', ')} – re-subscribing`,
+        );
+        // Only the dropped relays. Rebuilding every relay's subscription on each drop churned the
+        // healthy relays (one flapping relay re-subscribed all of them every few minutes).
+        for (const url of dead) listener.reopen(url);
+      } catch (err) {
+        this.logger.error(
+          `Could not re-open relays for ${pubkey.slice(0, 12)}...: ${printable(err)}`,
+        );
+      }
     }
   }
 
@@ -234,12 +244,19 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
   startListeningForKey(signerPubkeyHex: string, signerNsecHex: string, relays: string[]): void {
     const rawRelays = relays.length > 0 ? relays : [...this.defaultRelays];
+    // One entry per SOCKET: nostr-tools treats `wss://x`, `wss://x/` and a differently cased host as
+    // one connection, so a subscription per spelling would double every subscription, ping and
+    // reply on it (and relays cap subscriptions per connection: ditto answers a 21st with CLOSED).
+    const sockets = new Set<string>();
     const effectiveRelays = rawRelays.filter((url) => {
       const result = SafeRelayUrlSchema.safeParse(url);
       if (!result.success) {
         this.logger.warn(`Skipping unsafe relay URL (SSRF): ${url.slice(0, 50)}...`);
         return false;
       }
+      const socket = normalizeURL(url);
+      if (sockets.has(socket)) return false;
+      sockets.add(socket);
       return true;
     });
     if (effectiveRelays.length === 0) {
@@ -249,7 +266,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
     const existing = this.activeListeners.get(signerPubkeyHex);
     if (existing) {
-      const newRelays = effectiveRelays.filter((r) => !existing.relays.includes(r));
+      const known = new Set(existing.relays.map((r) => normalizeURL(r)));
+      const newRelays = effectiveRelays.filter((r) => !known.has(normalizeURL(r)));
       if (newRelays.length === 0) {
         return;
       }
@@ -260,12 +278,15 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     }
 
     const label = signerPubkeyHex.slice(0, 12);
-    // Requests being answered right now, so two relays delivering one request at the same moment
-    // are not both handled (the guard below only remembers a request once it is answered).
-    const inFlight = new Set<string>();
+    let lastSkewWarn = 0;
     const onevent = async (event: RelayEvent) => {
-      // Only requests the replay guard still remembers. A subscription is long-lived and its
-      // `since` was fixed when it opened, so it keeps accepting everything newer than that; this
+      // A self-ping of an earlier listener (another throwaway key, or before a restart) that a relay
+      // still serves: plaintext, never a request, and not worth a decrypt attempt.
+      if (event.content.startsWith('self-ping ')) {
+        this.logger.debug(`Ignoring a stale NIP-46 self-ping for ${label}...`);
+        return;
+      }
+      // Only requests the replay guard still remembers. A subscription is long-lived, so this
       // holds every accepted event inside the span the guard keeps its id for (see markHandled).
       const nowS = Math.floor(Date.now() / 1000);
       if (
@@ -273,21 +294,31 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
         event.created_at < nowS - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S ||
         event.created_at > nowS + NOSTR_CONSTANTS.NIP46_FUTURE_SKEW_S
       ) {
-        this.logger.debug(
-          `Ignoring NIP-46 event ${event.id.slice(0, 8)} for ${label}...: created_at is outside the accepted window`,
-        );
+        // A client whose clock is off by more than the window is otherwise dropped in silence: say
+        // so, at most once a minute per listener (anyone can publish such events to a relay).
+        const message = `Ignoring NIP-46 request ${event.id.slice(0, 8)} from ${event.pubkey.slice(0, 12)}... for ${label}...: its created_at is ${event.created_at - nowS}s off this server's clock (accepted: ${NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S}s back, ${NOSTR_CONSTANTS.NIP46_FUTURE_SKEW_S}s ahead)`;
+        if (Date.now() - lastSkewWarn >= 60_000) {
+          lastSkewWarn = Date.now();
+          this.logger.warn(message);
+        } else {
+          this.logger.debug(message);
+        }
         return;
       }
-      if (inFlight.has(event.id) || this.isHandled(signerPubkeyHex, event.id)) {
+      // In flight is per SERVICE, so a request still being answered by a listener that was just
+      // swapped out is not answered again by its replacement.
+      const flightKey = `${signerPubkeyHex}:${event.id}`;
+      if (this.inFlight.has(flightKey) || this.isHandled(signerPubkeyHex, event.id)) {
         this.logger.debug(
           `Ignoring re-delivered NIP-46 event ${event.id.slice(0, 8)} for ${label}...`,
         );
         return;
       }
-      inFlight.add(event.id);
+      this.inFlight.add(flightKey);
       try {
-        // Remembered only once it parsed as a request and was answered: undecryptable junk never
-        // takes a slot, and a request that failed (a database blip) is retried on redelivery.
+        // Remembered once it parsed as a request and was dealt with: undecryptable junk never takes
+        // a slot, a request that threw (a database blip) is retried on redelivery, and a reply no
+        // relay took is not (the client times out and asks again).
         if (
           await this.handleIncomingEvent(event, signerNsecHex, signerPubkeyHex, effectiveRelays)
         ) {
@@ -296,7 +327,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       } catch (err) {
         this.logger.error(`Error handling NIP-46 event: ${err}`);
       } finally {
-        inFlight.delete(event.id);
+        this.inFlight.delete(flightKey);
       }
     };
 
@@ -342,6 +373,9 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       timers.add(timer);
     };
     const onRelayEvent = (url: string, event: RelayEvent) => {
+      // A stopped listener (closed, or swapped for one with more relays) may still get events that
+      // were in flight when its subscriptions closed.
+      if (stopped) return;
       // This listener's self-pings (this round's, a late one, or one a relay copied from another
       // relay) are never requests; only the relay a ping was sent to counts as its echo.
       if (event.pubkey === pingPubkey) {
@@ -365,42 +399,49 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       retrying.delete(url);
       const openedAt = Date.now();
       let closedByUs = false;
+      let closedByRelay = false;
+      // nostr-tools rewrites `since` to the newest event this subscription has seen (including our
+      // own pings and anything dated ahead) whenever IT re-opens a socket, and it does so on the
+      // very object passed in. Left alone, a request from a client whose clock lags the pings is
+      // then dropped, and one dated ahead blinds the subscription for minutes. So `since` is a
+      // getter that always answers "now minus the window" and ignores the write.
+      const filter: Filter = { kinds: [NOSTR_CONSTANTS.NIP46_KIND], '#p': [signerPubkeyHex] };
+      Object.defineProperty(filter, 'since', {
+        enumerable: true,
+        get: () => Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
+        set: () => {},
+      });
       // Assigned after the callbacks below that compare against it, so it cannot be a const (reading it
       // from an onclose that fires before the assignment must see undefined, not a TDZ error).
       // eslint-disable-next-line prefer-const
       let handle: { close: () => void } | undefined;
-      const sub = this.pool.subscribe(
-        [url],
-        {
-          kinds: [NOSTR_CONSTANTS.NIP46_KIND],
-          '#p': [signerPubkeyHex],
-          since: Math.floor(Date.now() / 1000) - NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S,
+      const sub = this.pool.subscribe([url], filter, {
+        onevent: (event) => onRelayEvent(url, event),
+        onclose: (reasons) => {
+          if (!closedByUs) closedByRelay = true;
+          if (closedByUs || stopped || subs.get(url) !== handle) return;
+          if (Date.now() - openedAt >= RESUBSCRIBE_STABLE_MS) attempts.set(url, 0);
+          const n = attempts.get(url) ?? 0;
+          attempts.set(url, n + 1);
+          const step = Math.min(n, RESUBSCRIBE_BACKOFF_MS.length - 1);
+          const delay = jitter(RESUBSCRIBE_BACKOFF_MS[step] ?? 60_000, 0.2);
+          const why = printable(reasons.map((r) => r.reason).join('; '));
+          this.logger.warn(
+            `${url} closed the NIP-46 subscription for ${label}...: ${why} – re-subscribing in ${delay / 1000}s`,
+          );
+          retrying.add(url);
+          later(() => {
+            retrying.delete(url);
+            if (subs.get(url) === handle) open(url);
+          }, delay);
         },
-        {
-          onevent: (event) => onRelayEvent(url, event),
-          onclose: (reasons) => {
-            if (closedByUs || stopped || subs.get(url) !== handle) return;
-            if (Date.now() - openedAt >= RESUBSCRIBE_STABLE_MS) attempts.set(url, 0);
-            const n = attempts.get(url) ?? 0;
-            attempts.set(url, n + 1);
-            const step = Math.min(n, RESUBSCRIBE_BACKOFF_MS.length - 1);
-            const delay = jitter(RESUBSCRIBE_BACKOFF_MS[step] ?? 60_000, 0.2);
-            const why = printable(reasons.map((r) => r.reason).join('; '));
-            this.logger.warn(
-              `${url} closed the NIP-46 subscription for ${label}...: ${why} – re-subscribing in ${delay / 1000}s`,
-            );
-            retrying.add(url);
-            later(() => {
-              retrying.delete(url);
-              if (subs.get(url) === handle) open(url);
-            }, delay);
-          },
-        },
-      );
+      });
       handle = {
         close: () => {
           closedByUs = true;
-          sub.close();
+          // Closing a subscription its relay already closed would make nostr-tools count the
+          // operation down twice on the shared socket and idle-close it under other signers.
+          if (!closedByRelay) sub.close();
         },
       };
       subs.set(url, handle);
@@ -408,6 +449,8 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     for (const url of effectiveRelays) open(url);
 
     const selfPing = (url: string) => {
+      // A closed subscription cannot echo, and its retry may land before the ping times out.
+      if (retrying.has(url)) return;
       // The sequence number keeps every ping's id distinct: same author, kind, tags and second
       // would otherwise give every relay of one round the SAME id, and the echo map (id -> relay)
       // would then recognise only the last relay's.
