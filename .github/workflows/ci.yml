@@ -13,8 +13,11 @@ on:
 permissions:
   contents: read
 
+# Inside a reusable-workflow call `github.workflow` is the CALLER's name, so this group must differ from
+# the caller's own (sovtech-release uses `<workflow>-<ref>`): an identical group is a deadlock and GitHub
+# fails the whole run before any job starts.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
