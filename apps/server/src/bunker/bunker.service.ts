@@ -32,7 +32,10 @@ useWebSocketImplementation(WebSocket);
 const SLOW_PUBLISH_MS = 5_000;
 
 /** Relay-supplied text for a log line: printable ASCII only, bounded. */
-const printable = (value: unknown) => String(value).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+const printable = (value: unknown) =>
+  String(value)
+    .replace(/[^\x20-\x7e]/g, '?')
+    .slice(0, 80);
 
 interface ActiveListener {
   relays: string[];

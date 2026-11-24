@@ -251,7 +251,10 @@ describe('BunkerService', () => {
     }
 
     function readReply(publish: ReturnType<typeof vi.fn>) {
-      const [to, event] = publish.mock.calls[0] as [string[], { content: string; tags: string[][] }];
+      const [to, event] = publish.mock.calls[0] as [
+        string[],
+        { content: string; tags: string[][] },
+      ];
       const ck = nip44.v2.utils.getConversationKey(clientSk, signerPk);
       return { to, tags: event.tags, reply: JSON.parse(nip44.v2.decrypt(event.content, ck)) };
     }
