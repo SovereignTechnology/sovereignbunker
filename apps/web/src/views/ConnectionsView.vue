@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, computed } from 'vue';
 import { useActivityStream } from '@/composables/useActivityStream';
+import { useStore } from '@nanostores/vue';
 import { useRouter, useRoute } from 'vue-router';
 import { Link2, KeyRound, Plug, Lock, Search } from '@lucide/vue';
 import { api } from '@/lib/api';
 import { useUiStore } from '@/stores/ui';
+import { $approvalsCanAsk } from '@/stores/approvals';
 import { useFormatting } from '@/composables/useFormatting';
 import Button from '@/components/ui/Button.vue';
 import Card from '@/components/ui/Card.vue';
@@ -106,6 +108,8 @@ const generatePerms = ref<PermissionDescriptor[]>(freshDefaults());
 const generateAsk = ref(false);
 const importPerms = ref<PermissionDescriptor[]>(freshDefaults());
 const importAsk = ref(true);
+/** False when the server has no PUBLIC_BASE_URL: nothing can be sent as ASK then. */
+const canAsk = useStore($approvalsCanAsk);
 /** What the pasted URI asked for beyond the kinds it pre-ticks: shown, never ticked. */
 const importFlagged = ref<PermissionDescriptor[]>([]);
 
@@ -236,7 +240,7 @@ async function generateBunkerUri() {
       nsecKeyId: selectedKeyId.value,
       name: connectionName.value || undefined,
       permissions: generatePerms.value,
-      approvalMode: generateAsk.value ? 'ASK' : 'DENY',
+      approvalMode: generateAsk.value && canAsk.value ? 'ASK' : 'DENY',
     });
     generatedUri.value = res.uri;
   } catch (err) {
@@ -262,7 +266,7 @@ async function importConnection() {
   const uri = bunkerUri.value;
   const keyId = selectedKeyId.value;
   const permissions = importPerms.value.map((p) => ({ ...p }));
-  const approvalMode = importAsk.value ? 'ASK' : 'DENY';
+  const approvalMode = importAsk.value && canAsk.value ? 'ASK' : 'DENY';
 
   try {
     const parsed = await api.post<any>('/bunker/parse-uri', { uri });

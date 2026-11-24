@@ -139,6 +139,14 @@ const permission = (a: PendingApprovalDto) => (a.kind != null ? `${a.method}:${a
 const secondsLeft = (a: PendingApprovalDto) =>
   isGone(a) ? 0 : Math.max(0, Math.ceil((Date.parse(a.expiresAt) - now.value) / 1000));
 
+const cardClass = (a: PendingApprovalDto) =>
+  [
+    a.token === focusToken.value ? 'border-amber-500 ring-1 ring-amber-500/40' : '',
+    isGone(a) ? 'opacity-60' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
 const hasPreview = (a: PendingApprovalDto) => {
   const p = a.preview;
   return (
@@ -262,10 +270,7 @@ function askAlways(a: PendingApprovalDto) {
         :key="a.token"
         data-testid="approval-card"
         :data-state="isGone(a) ? 'expired' : 'waiting'"
-        :class="[
-          a.token === focusToken ? 'border-amber-500 ring-1 ring-amber-500/40' : '',
-          isGone(a) ? 'opacity-60' : '',
-        ]"
+        :class="cardClass(a)"
       >
         <div class="flex items-start justify-between gap-3 mb-3">
           <div class="min-w-0">

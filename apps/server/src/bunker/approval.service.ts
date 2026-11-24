@@ -88,7 +88,8 @@ interface Entry {
  * characters. Astral ranges need the `u` flag.
  */
 const CONTROL_CHARS =
-  // eslint-disable-next-line no-control-regex
+  // The class holds variation selectors and tag characters on purpose: it removes them.
+  // eslint-disable-next-line no-control-regex, no-misleading-character-class
   /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u200b-\u200f\u2028-\u202e\u2060-\u2069\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
 
 const clean = (text: string, replacement: string) => text.replace(CONTROL_CHARS, replacement);

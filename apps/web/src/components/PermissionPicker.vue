@@ -48,9 +48,14 @@ const loginGranted = computed(() =>
 );
 /** A sign_event grant that covers every kind also covers login: the preset has nothing to choose. */
 const loginCoveredByAllKinds = computed(() => isAllKinds('sign_event'));
+/** What is shown and sent: asking is only ever on while the server can ask. */
+const askOn = computed(() => ask.value && canAsk.value);
 const loginChoice = computed<'always' | 'ask' | 'refuse'>(() =>
-  loginGranted.value ? 'always' : ask.value ? 'ask' : 'refuse',
+  loginGranted.value ? 'always' : askOn.value ? 'ask' : 'refuse',
 );
+function onAskChange(event: Event) {
+  ask.value = canAsk.value && (event.target as HTMLInputElement).checked;
+}
 
 function toggleMethod(method: string) {
   // Toggle a method-level (all-kinds) grant. Granting all kinds replaces any kind-scoped rows for it.
@@ -270,11 +275,12 @@ function chooseLogin(choice: 'ask' | 'always') {
     <!-- Ask mode: hold what the connection has no permission for. -->
     <label class="flex items-start gap-2 text-sm cursor-pointer">
       <input
-        v-model="ask"
         type="checkbox"
+        :checked="askOn"
         data-testid="ask-checkbox"
         class="mt-1"
         :disabled="!canAsk"
+        @change="onAskChange"
       />
       <span>
         <strong>Ask me</strong> when this app needs something it has no permission for
