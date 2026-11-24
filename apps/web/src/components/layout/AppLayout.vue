@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useStore } from '@nanostores/vue';
 import {
@@ -11,8 +11,10 @@ import {
   SlidersHorizontal,
   PanelLeft,
   Menu,
+  BellRing,
 } from '@lucide/vue';
-import { useAuthStore } from '@/stores/auth';
+import { useAuthStore, $auth } from '@/stores/auth';
+import { $pendingApprovalCount, startApprovalWatch, stopApprovalWatch } from '@/stores/approvals';
 import { useUiStore, $ui } from '@/stores/ui';
 import { useSettingsStore } from '@/stores/settings';
 import Button from '@/components/ui/Button.vue';
@@ -24,10 +26,25 @@ const ui = useUiStore();
 const uiState = useStore($ui);
 const settingsStore = useSettingsStore();
 const mobileMenuOpen = ref(false);
+const authState = useStore($auth);
+const pendingApprovals = useStore($pendingApprovalCount);
 
 onMounted(() => {
   auth.refetchProfileIfMissing();
 });
+
+// Requests the signer is holding for the operator: watched for as long as someone is signed in
+// (pushed by the server when it can, polled when it cannot), and stopped on logout.
+const signedIn = computed(() => !!authState.value.accessToken && !authState.value.requiresTotp);
+watch(
+  signedIn,
+  (ok) => {
+    if (ok) startApprovalWatch();
+    else stopApprovalWatch();
+  },
+  { immediate: true },
+);
+onUnmounted(stopApprovalWatch);
 
 const showLayout = computed(() => {
   const guestRoutes = ['login', 'register', '2fa-verify'];
@@ -38,6 +55,7 @@ const navItems = [
   { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
   { name: 'Keys', path: '/keys', icon: Key },
   { name: 'Connections', path: '/connections', icon: Link2 },
+  { name: 'Approvals', path: '/approvals', icon: BellRing, badge: 'approvals' as const },
   { name: 'Relays', path: '/settings/relays', icon: Radio },
   { name: 'Security', path: '/settings/security', icon: Shield },
   { name: 'Settings', path: '/settings/general', icon: SlidersHorizontal },
@@ -100,6 +118,14 @@ async function handleLogout() {
         >
           <component :is="item.icon" class="w-5 h-5 shrink-0" />
           <span v-if="!uiState.sidebarCollapsed">{{ item.name }}</span>
+          <span
+            v-if="item.badge === 'approvals' && pendingApprovals > 0"
+            data-testid="approvals-badge"
+            class="ml-auto min-w-5 h-5 px-1.5 rounded-full bg-amber-500 text-white text-xs font-semibold flex items-center justify-center"
+            :title="`${pendingApprovals} waiting for your approval`"
+          >
+            {{ pendingApprovals }}
+          </span>
         </router-link>
       </nav>
 
@@ -138,7 +164,18 @@ async function handleLogout() {
           <Menu class="w-6 h-6" />
         </button>
 
-        <div class="flex-1" />
+        <div class="flex-1 flex items-center">
+          <router-link
+            v-if="pendingApprovals > 0"
+            to="/approvals"
+            data-testid="approvals-pill"
+            class="inline-flex items-center gap-2 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 px-3 py-1 text-sm font-medium hover:bg-amber-500/25 transition-colors"
+          >
+            <BellRing class="w-4 h-4 shrink-0" />
+            {{ pendingApprovals }}
+            {{ pendingApprovals === 1 ? 'request is' : 'requests are' }} waiting for you
+          </router-link>
+        </div>
 
         <div class="flex items-center gap-3">
           <span v-if="auth.user" class="text-sm text-muted-foreground hidden sm:block">

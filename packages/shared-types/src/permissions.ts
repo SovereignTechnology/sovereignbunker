@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import { Nip46Method } from './nip46.js';
 
+/**
+ * The last event kind there is: NIP-01 makes a kind a 16-bit integer. Also well inside the database's
+ * 32-bit column, so a stored kind can never fail to insert (which would drop an audit row).
+ */
+export const MAX_EVENT_KIND = 65535;
+
 export const PermissionDescriptorSchema = z.object({
   method: Nip46Method,
-  kind: z.number().int().nonnegative().optional(),
+  kind: z.number().int().min(0).max(MAX_EVENT_KIND).optional(),
 });
 export type PermissionDescriptor = z.infer<typeof PermissionDescriptorSchema>;
 
@@ -27,10 +33,13 @@ export const DEFAULT_CONNECTION_PERMISSIONS: readonly PermissionDescriptor[] = [
 export function parsePermissionString(perm: string): PermissionDescriptor {
   const [method, kindStr] = perm.split(':');
   const parsed = Nip46Method.parse(method);
-  return {
-    method: parsed,
-    kind: kindStr ? parseInt(kindStr, 10) : undefined,
-  };
+  if (!kindStr) return { method: parsed, kind: undefined };
+  // Digits only, in range: "abc", "-4", "1.5" and "3000000000" are refused here (and skipped by
+  // parsePermissionList) instead of becoming NaN or a kind that cannot be signed or stored.
+  if (!/^\d{1,5}$/.test(kindStr) || Number(kindStr) > MAX_EVENT_KIND) {
+    throw new Error(`Invalid event kind in permission: ${kindStr.slice(0, 12)}`);
+  }
+  return { method: parsed, kind: Number(kindStr) };
 }
 
 export function formatPermission(perm: PermissionDescriptor): string {
@@ -59,3 +68,53 @@ export function checkPermission(
     (g) => g.method === required.method && (g.kind === undefined || g.kind === required.kind),
   );
 }
+
+/**
+ * The methods the signer gates behind an explicit permission (default-deny). The others (connect,
+ * ping, get_public_key, switch_relays) are always available, so they never need granting.
+ */
+export const GATED_PERMISSION_METHODS = [
+  'sign_event',
+  'nip04_encrypt',
+  'nip04_decrypt',
+  'nip44_encrypt',
+  'nip44_decrypt',
+] as const;
+
+/** True when `method` needs an explicit permission (see GATED_PERMISSION_METHODS). */
+export function isGatedMethod(method: string): method is (typeof GATED_PERMISSION_METHODS)[number] {
+  return (GATED_PERMISSION_METHODS as readonly string[]).includes(method);
+}
+
+/**
+ * The event kind clients sign to log in to a website (NIP-98 HTTP auth, e.g. a BIES remote-signer
+ * login). Granting it permanently lets the client sign logins for any site, including ones that
+ * delete an account, so the UI offers "ask each time" first.
+ */
+export const LOGIN_EVENT_KIND = 27235;
+
+/**
+ * The event kinds ordinary enough that granting one for good needs no more than the click that grants
+ * it: a short note (1), a repost (6), a reaction (7) and a generic repost (16). EVERYTHING else (a
+ * profile, a follow list, a seal, a zap request, wallet-connect, Blossom or HTTP auth, event
+ * deletion, relay auth, remote-signer messages, ...) is a grant of something wide, and so is any
+ * encrypt or decrypt: those need an explicit confirmation. A list of what is dangerous would always
+ * be one entry short; this is the short list of what is not.
+ */
+export const ORDINARY_EVENT_KINDS: readonly number[] = [1, 6, 7, 16];
+
+/**
+ * True when granting this permission for good (or approving a request for it that is waiting in a
+ * list) needs the operator's explicit confirmation: the server refuses it without one, and the UI
+ * asks a second time. False only for `sign_event` of an ordinary kind (see ORDINARY_EVENT_KINDS).
+ */
+export function grantNeedsConfirmation(perm: PermissionDescriptor): boolean {
+  return !(
+    perm.method === 'sign_event' &&
+    perm.kind !== undefined &&
+    ORDINARY_EVENT_KINDS.includes(perm.kind)
+  );
+}
+
+/** A bound on any permission list that arrives over the API (the picker offers a few dozen at most). */
+export const MAX_PERMISSIONS_PER_REQUEST = 64;

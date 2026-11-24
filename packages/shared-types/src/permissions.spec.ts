@@ -4,6 +4,8 @@ import {
   formatPermission,
   parsePermissionList,
   checkPermission,
+  grantNeedsConfirmation,
+  ORDINARY_EVENT_KINDS,
 } from './permissions';
 
 describe('permissions', () => {
@@ -44,4 +46,59 @@ describe('permissions', () => {
     const granted = [{ method: 'sign_event' as const, kind: 1 }];
     expect(checkPermission(granted, { method: 'sign_event', kind: 2 })).toBe(false);
   });
+
+  describe('kind range', () => {
+    it.each([
+      'sign_event:65536',
+      'sign_event:3000000000',
+      'sign_event:abc',
+      'sign_event:-4',
+      'sign_event:1.5',
+    ])('refuses %s: it could never be signed and would not fit the database', (perm) => {
+      expect(() => parsePermissionString(perm)).toThrow();
+    });
+
+    it('keeps 0 and 65535', () => {
+      expect(parsePermissionString('sign_event:0').kind).toBe(0);
+      expect(parsePermissionString('sign_event:65535').kind).toBe(65535);
+    });
+
+    it('a list skips the entries it refuses and keeps the rest', () => {
+      expect(parsePermissionList('sign_event:1,sign_event:3000000000,nip44_decrypt')).toEqual([
+        { method: 'sign_event', kind: 1 },
+        { method: 'nip44_decrypt', kind: undefined },
+      ]);
+    });
+  });
+});
+
+describe('grantNeedsConfirmation', () => {
+  it('the ordinary kinds are 1, 6, 7 and 16, and nothing else', () => {
+    expect([...ORDINARY_EVENT_KINDS].sort((a, b) => a - b)).toEqual([1, 6, 7, 16]);
+  });
+
+  it.each([1, 6, 7, 16])('a grant of sign_event:%i needs no confirmation', (kind) => {
+    expect(grantNeedsConfirmation({ method: 'sign_event', kind })).toBe(false);
+  });
+
+  // The rule is inverted on purpose: a list of what is dangerous is always one entry short, so every
+  // kind that is not on the short ordinary list needs the second step.
+  it.each([
+    0, 2, 3, 4, 5, 8, 9, 13, 14, 15, 17, 40, 1059, 1984, 9734, 9735, 10002, 22242, 23194, 23195,
+    24133, 24242, 27235, 30023, 30078, 65535,
+  ])('a grant of sign_event:%i needs one', (kind) => {
+    expect(grantNeedsConfirmation({ method: 'sign_event', kind })).toBe(true);
+  });
+
+  it('every kind at once (sign_event with no kind) needs one', () => {
+    expect(grantNeedsConfirmation({ method: 'sign_event' })).toBe(true);
+  });
+
+  it.each(['nip04_encrypt', 'nip04_decrypt', 'nip44_encrypt', 'nip44_decrypt'] as const)(
+    '%s needs one, with or without a kind',
+    (method) => {
+      expect(grantNeedsConfirmation({ method })).toBe(true);
+      expect(grantNeedsConfirmation({ method, kind: 1 })).toBe(true);
+    },
+  );
 });

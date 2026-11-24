@@ -2,11 +2,20 @@
 import { ref, onMounted, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { api } from '@/lib/api';
+import { useActivityStream } from '@/composables/useActivityStream';
 import { useFormatting } from '@/composables/useFormatting';
 import Button from '@/components/ui/Button.vue';
 import Card from '@/components/ui/Card.vue';
 import Badge from '@/components/ui/Badge.vue';
 import PubkeyDisplay from '@/components/PubkeyDisplay.vue';
+import { useStore } from '@nanostores/vue';
+import {
+  GATED_PERMISSION_METHODS,
+  MAX_EVENT_KIND,
+  grantNeedsConfirmation,
+  type PermissionDescriptor,
+} from '@bunker46/shared-types';
+import { $approvalsCanAsk } from '@/stores/approvals';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -27,13 +36,7 @@ const logsLoading = ref(false);
 
 // Methods the signer gates behind explicit permission (default-deny). The others
 // (connect, ping, get_public_key, switch_relays) are always available.
-const GATED_METHODS = [
-  'sign_event',
-  'nip04_encrypt',
-  'nip04_decrypt',
-  'nip44_encrypt',
-  'nip44_decrypt',
-];
+const GATED_METHODS = GATED_PERMISSION_METHODS;
 
 type Perm = { method: string; kind?: number | null; allowed?: boolean };
 
@@ -72,16 +75,34 @@ function isMethodAllKinds(method: string) {
 
 const wirePerm = (p: Perm) => ({ method: p.method, ...(p.kind != null ? { kind: p.kind } : {}) });
 
+// Only the latest reload may apply: an activity-triggered GET that started before a permission change
+// must not land after it and bring the old list (and a revoked grant) back.
+let latestReload = 0;
 async function reloadConnection() {
-  connection.value = await api.get(`/connections/${route.params.id}`);
+  const seq = ++latestReload;
+  const fresh = await api.get<any>(`/connections/${route.params.id}`);
+  if (seq === latestReload) connection.value = fresh;
+}
+
+/** Why the last permission change failed ('' when it did not): said, not swallowed. */
+const permError = ref('');
+async function guarded(action: () => Promise<void>) {
+  permError.value = '';
+  try {
+    await action();
+  } catch (err) {
+    permError.value = err instanceof Error ? err.message : 'Could not change the permissions';
+  }
 }
 
 // Replace the GRANTED whitelist; the backend preserves any pending requests.
 async function setGranted(perms: Perm[]) {
-  await api.put(`/connections/${route.params.id}/permissions`, {
-    permissions: perms.map(wirePerm),
+  await guarded(async () => {
+    await api.put(`/connections/${route.params.id}/permissions`, {
+      permissions: perms.map(wirePerm),
+    });
+    await reloadConnection();
   });
-  await reloadConnection();
 }
 
 // Grant a method for ALL kinds: replace any kind-scoped grants for this method with a single
@@ -99,9 +120,15 @@ const newKind = ref('');
 
 // Grant a single specific event kind (e.g. sign_event:30078) typed by the operator. No-op on an
 // invalid number or a kind that is already granted (either specifically or via an all-kinds grant).
-async function grantKind(method: string, kindStr: string) {
-  const kind = Number.parseInt(kindStr, 10);
-  if (!Number.isInteger(kind) || kind < 0) return;
+async function grantKind(method: string, kindStr: string | number) {
+  // Digits only, and an event kind is 16 bits: parseInt would read "1e3" as 1 and "3000000000" as a
+  // kind the server (and the database) cannot take. A number input hands v-model a number, not text.
+  const text = String(kindStr).trim();
+  const kind = Number(text);
+  if (!/^\d{1,5}$/.test(text) || kind > MAX_EVENT_KIND) {
+    permError.value = `A kind is a whole number from 0 to ${MAX_EVENT_KIND}`;
+    return;
+  }
   const alreadyGranted = grantedPerms.value.some(
     (p) => p.method === method && (p.kind == null || p.kind === kind),
   );
@@ -109,8 +136,10 @@ async function grantKind(method: string, kindStr: string) {
     newKind.value = '';
     return;
   }
+  permError.value = '';
   await setGranted([...grantedPerms.value, { method, kind }]);
-  newKind.value = '';
+  // Kept when it failed, so the operator can see what was refused and fix it.
+  if (!permError.value) newKind.value = '';
 }
 
 async function revokePerm(perm: Perm) {
@@ -125,29 +154,88 @@ async function revokeAll() {
   await setGranted([]);
 }
 
-async function approvePerm(perm: Perm) {
-  await api.post(`/connections/${route.params.id}/permissions/approve`, {
-    permissions: [wirePerm(perm)],
+/** The request whose approval is waiting for its second, confirming click. */
+const confirmingPerm = ref('');
+/** Rows are filed by the client, so a wide one (see grantNeedsConfirmation) is never one click. */
+const needsConfirm = (perm: Perm) =>
+  grantNeedsConfirmation({
+    method: perm.method as PermissionDescriptor['method'],
+    kind: perm.kind ?? undefined,
   });
-  await reloadConnection();
+
+async function approvePerm(perm: Perm) {
+  const confirm = needsConfirm(perm);
+  if (confirm && confirmingPerm.value !== permLabel(perm)) {
+    confirmingPerm.value = permLabel(perm);
+    return;
+  }
+  confirmingPerm.value = '';
+  await guarded(async () => {
+    await api.post(`/connections/${route.params.id}/permissions/approve`, {
+      permissions: [wirePerm(perm)],
+      ...(confirm ? { confirm: true } : {}),
+    });
+    await reloadConnection();
+  });
 }
 
 async function denyPerm(perm: Perm) {
-  await api.post(`/connections/${route.params.id}/permissions/deny`, {
-    permissions: [wirePerm(perm)],
+  confirmingPerm.value = '';
+  await guarded(async () => {
+    await api.post(`/connections/${route.params.id}/permissions/deny`, {
+      permissions: [wirePerm(perm)],
+    });
+    await reloadConnection();
   });
-  await reloadConnection();
 }
 
+/** Said after "Approve all" when some requests were left for a deliberate, per-row approval. */
+const approveAllNote = ref('');
+
 async function approveAllPending() {
-  await api.post(`/connections/${route.params.id}/permissions/approve`, {});
-  await reloadConnection();
+  approveAllNote.value = '';
+  confirmingPerm.value = '';
+  await guarded(async () => {
+    const res = await api.post<{ approved?: number; needConfirmation?: number }>(
+      `/connections/${route.params.id}/permissions/approve-all`,
+    );
+    const left = res?.needConfirmation ?? 0;
+    if (left > 0) {
+      approveAllNote.value = `${left} request${left > 1 ? 's' : ''} for a wide permission (a login, a profile, an encrypt or decrypt, ...) ${left > 1 ? 'were' : 'was'} not approved: approve each one yourself.`;
+    }
+    await reloadConnection();
+  });
 }
 
 async function denyAllPending() {
-  await api.post(`/connections/${route.params.id}/permissions/deny`, {});
-  await reloadConnection();
+  approveAllNote.value = '';
+  confirmingPerm.value = '';
+  await guarded(async () => {
+    await api.post(`/connections/${route.params.id}/permissions/deny-all`);
+    await reloadConnection();
+  });
 }
+
+// Hold a request this connection has no permission for until the operator decides (ASK), or refuse
+// it at once (DENY). Turning ASK off answers anything being held right now.
+async function setApprovalMode(mode: 'DENY' | 'ASK') {
+  if (!connection.value || connection.value.approvalMode === mode) return;
+  modeError.value = '';
+  try {
+    await api.patch(`/connections/${route.params.id}/approval-mode`, { mode });
+    connection.value.approvalMode = mode;
+  } catch (err) {
+    modeError.value = err instanceof Error ? err.message : 'Could not change the mode';
+  }
+}
+const modeError = ref('');
+/** False when the server has no PUBLIC_BASE_URL: asking cannot be turned on (it can be turned off). */
+const canAsk = useStore($approvalsCanAsk);
+
+// Pending requests and held requests arrive while the page is open: refetch on every activity event.
+useActivityStream(() => {
+  reloadConnection().catch(() => undefined);
+});
 
 async function toggleLogging() {
   if (!connection.value) return;
@@ -309,6 +397,15 @@ function formatTime(ts: string) {
           </div>
         </div>
 
+        <p
+          v-if="permError"
+          class="mb-3 text-xs text-destructive"
+          role="alert"
+          data-testid="perm-error"
+        >
+          {{ permError }}
+        </p>
+
         <!-- Pending requests awaiting operator approval -->
         <div
           v-if="pendingPerms.length"
@@ -322,6 +419,7 @@ function formatTime(ts: string) {
             <div class="flex gap-2">
               <button
                 class="text-xs text-primary hover:underline cursor-pointer"
+                data-testid="approve-all"
                 @click="approveAllPending"
               >
                 Approve all
@@ -334,27 +432,48 @@ function formatTime(ts: string) {
               </button>
             </div>
           </div>
+          <p
+            v-if="approveAllNote"
+            class="text-xs text-amber-600 dark:text-amber-400 mb-2"
+            data-testid="approve-all-note"
+          >
+            {{ approveAllNote }}
+          </p>
           <div class="space-y-1">
-            <div
-              v-for="perm in pendingPerms"
-              :key="permLabel(perm)"
-              class="flex items-center justify-between py-1"
-            >
-              <span class="text-sm font-mono">{{ permLabel(perm) }}</span>
-              <div class="flex gap-1">
-                <button
-                  class="text-xs px-2 py-1 rounded bg-primary/10 text-primary hover:bg-primary/20 cursor-pointer"
-                  @click="approvePerm(perm)"
-                >
-                  Approve
-                </button>
-                <button
-                  class="text-xs px-2 py-1 rounded bg-destructive/10 text-destructive hover:bg-destructive/20 cursor-pointer"
-                  @click="denyPerm(perm)"
-                >
-                  Deny
-                </button>
+            <div v-for="perm in pendingPerms" :key="permLabel(perm)" class="py-1">
+              <div class="flex items-center justify-between">
+                <span class="text-sm font-mono">
+                  {{ permLabel(perm) }}
+                  <span
+                    v-if="needsConfirm(perm)"
+                    class="ml-1 text-xs font-sans text-amber-600 dark:text-amber-400"
+                    >needs your confirmation</span
+                  >
+                </span>
+                <div class="flex gap-1">
+                  <button
+                    class="text-xs px-2 py-1 rounded bg-primary/10 text-primary hover:bg-primary/20 cursor-pointer"
+                    data-testid="approve-perm"
+                    @click="approvePerm(perm)"
+                  >
+                    {{ confirmingPerm === permLabel(perm) ? 'Yes, approve for good' : 'Approve' }}
+                  </button>
+                  <button
+                    class="text-xs px-2 py-1 rounded bg-destructive/10 text-destructive hover:bg-destructive/20 cursor-pointer"
+                    @click="denyPerm(perm)"
+                  >
+                    Deny
+                  </button>
+                </div>
               </div>
+              <p
+                v-if="confirmingPerm === permLabel(perm)"
+                class="mt-1 text-xs text-destructive"
+                data-testid="approve-perm-warning"
+              >
+                Approving {{ permLabel(perm) }} is permanent and wide: this app asked for it, and it
+                will not be asked about it again. Click again to confirm.
+              </p>
             </div>
           </div>
         </div>
@@ -436,7 +555,7 @@ function formatTime(ts: string) {
             />
             <button
               class="h-9 px-3 rounded-md bg-primary/10 text-primary text-sm hover:bg-primary/20 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-              :disabled="!newKind"
+              :disabled="String(newKind).trim() === ''"
               @click="grantKind('sign_event', newKind)"
             >
               Add kind
@@ -525,6 +644,52 @@ function formatTime(ts: string) {
         <Card>
           <h2 class="text-lg font-semibold mb-4">Options</h2>
           <div class="space-y-4">
+            <div>
+              <div class="flex items-center justify-between gap-4">
+                <div>
+                  <div class="font-medium text-sm">Ask me instead of refusing</div>
+                  <div class="text-xs text-muted-foreground">
+                    When this app needs something it has no permission for, it waits for your answer
+                    on the
+                    <router-link to="/approvals" class="text-primary hover:underline">
+                      Approvals
+                    </router-link>
+                    page instead of being refused. Only for apps that can wait (a NIP-46
+                    <code class="font-mono">auth_url</code> reply, as BIES does).
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  data-testid="approval-mode-toggle"
+                  aria-label="Ask me instead of refusing"
+                  :aria-pressed="connection.approvalMode === 'ASK'"
+                  :disabled="!canAsk && connection.approvalMode !== 'ASK'"
+                  :class="[
+                    'w-12 h-6 rounded-full transition-colors cursor-pointer relative shrink-0 disabled:opacity-50 disabled:cursor-not-allowed',
+                    connection.approvalMode === 'ASK' ? 'bg-primary' : 'bg-muted',
+                  ]"
+                  @click="setApprovalMode(connection.approvalMode === 'ASK' ? 'DENY' : 'ASK')"
+                >
+                  <span
+                    :class="[
+                      'absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform',
+                      connection.approvalMode === 'ASK' ? 'left-6' : 'left-0.5',
+                    ]"
+                  />
+                </button>
+              </div>
+              <p
+                v-if="!canAsk && connection.approvalMode !== 'ASK'"
+                class="text-xs text-destructive mt-1"
+                data-testid="ask-unavailable"
+              >
+                Not available: this server has no <code class="font-mono">PUBLIC_BASE_URL</code>, so
+                an app could not be told where to approve.
+              </p>
+              <p v-if="modeError" class="text-xs text-destructive mt-1" role="alert">
+                {{ modeError }}
+              </p>
+            </div>
             <div class="flex items-center justify-between">
               <div>
                 <div class="font-medium text-sm">Detailed Logging</div>
