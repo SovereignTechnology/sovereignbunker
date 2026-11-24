@@ -198,7 +198,8 @@ describe('ConnectionDetailView: requests a client filed', () => {
         expect(apiPut).not.toHaveBeenCalled();
         expect(w.get('[data-testid="perm-error"]').text()).toContain('65535');
         // What was typed stays, so the operator can see what was refused.
-        expect((kindInput(w).element as HTMLInputElement).value).toBe(text);
+        // (A number input may write "1e21" back as "1e+21": the same number.)
+        expect(Number((kindInput(w).element as HTMLInputElement).value)).toBe(Number(text));
       },
     );
 

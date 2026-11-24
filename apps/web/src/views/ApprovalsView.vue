@@ -400,9 +400,9 @@ function askOnce(a: PendingApprovalDto) {
             >
               <template v-if="a.preview.eventTime">
                 Event dated {{ a.preview.eventTime }}
-                <template v-if="a.preview.eventTimeOff"> (more than a day from now)</template>
+                <template v-if="a.preview.eventTimeOff"> (more than a day from now) </template>
               </template>
-              <template v-else>Event date is not a valid time</template>
+              <template v-else> Event date is not a valid time </template>
             </p>
 
             <!-- Encrypt and decrypt: with whom. -->
