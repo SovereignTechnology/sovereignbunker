@@ -12,8 +12,11 @@ import * as nip44 from 'nostr-tools/nip44';
 import * as nip04 from 'nostr-tools/nip04';
 import { BunkerRpcHandler } from './bunker-rpc.handler.js';
 import {
+  Nip46Method,
+  Nip46RequestEnvelopeSchema,
   Nip46RequestSchema,
   SafeRelayUrlSchema,
+  type Nip46Response,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
 import { NOSTR_CONSTANTS, NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN } from '@bunker46/config';
@@ -24,6 +27,15 @@ import { normalizeURL } from 'nostr-tools/utils';
 import WebSocket from 'ws';
 
 useWebSocketImplementation(WebSocket);
+
+/** A relay that takes longer than this to accept a NIP-46 reply is reported as slow. */
+const SLOW_PUBLISH_MS = 5_000;
+
+/** Relay-supplied text for a log line: printable ASCII only, bounded. */
+const printable = (value: unknown) =>
+  String(value)
+    .replace(/[^\x20-\x7e]/g, '?')
+    .slice(0, 80);
 
 interface ActiveListener {
   relays: string[];
@@ -313,15 +325,33 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    let parsed;
+    let raw: unknown;
     try {
-      parsed = Nip46RequestSchema.safeParse(JSON.parse(decryptedContent));
+      raw = JSON.parse(decryptedContent);
     } catch {
       this.logger.warn(`Failed to parse NIP-46 JSON from ${clientPubkey.slice(0, 12)}...`);
       return;
     }
 
+    const parsed = Nip46RequestSchema.safeParse(raw);
     if (!parsed.success) {
+      // NIP-46: requests with unknown or unsupported methods MUST be replied with an error.
+      // Without a reply the client waits for its own timeout (e.g. nostr-tools' `logout`).
+      const envelope = Nip46RequestEnvelopeSchema.safeParse(raw);
+      if (envelope.success && !Nip46Method.safeParse(envelope.data.method).success) {
+        const method = envelope.data.method.replace(/[^A-Za-z0-9_]/g, '?');
+        this.logger.warn(
+          `Unsupported NIP-46 method ${method} from ${clientPubkey.slice(0, 12)}... – replying with an error`,
+        );
+        await this.sendResponse(
+          { id: envelope.data.id, error: `unsupported method: ${method}` },
+          method,
+          clientPubkey,
+          signerSecretKey,
+          relays,
+        );
+        return;
+      }
       this.logger.warn(`Invalid NIP-46 request schema from ${clientPubkey.slice(0, 12)}...`);
       return;
     }
@@ -353,6 +383,17 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       (nsec) => getPublicKey(hexToBytes(nsec)),
     );
 
+    await this.sendResponse(response, parsed.data.method, clientPubkey, signerSecretKey, relays);
+  }
+
+  /** Encrypt a NIP-46 response to the client and publish it on the listener's relays. */
+  private async sendResponse(
+    response: Nip46Response,
+    method: string,
+    clientPubkey: string,
+    signerSecretKey: Uint8Array,
+    relays: string[],
+  ) {
     const responseJson = JSON.stringify(response);
     const conversationKey = nip44.v2.utils.getConversationKey(signerSecretKey, clientPubkey);
     const encryptedResponse = nip44.v2.encrypt(responseJson, conversationKey);
@@ -368,12 +409,52 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     );
 
     try {
-      await Promise.any(this.pool.publish(relays, responseEvent));
-      this.logger.log(
-        `NIP-46 response sent for ${parsed.data.method} to ${clientPubkey.slice(0, 12)}...`,
+      const started = Date.now();
+      const attempts = this.pool.publish(relays, responseEvent);
+      // Fire-and-forget, but never as an unhandled rejection (process guards treat those as fatal).
+      this.reportPublishOutcome(method, relays, attempts, started).catch((err: unknown) =>
+        this.logger.debug(`Could not report NIP-46 publish outcome: ${printable(err)}`),
       );
+      await Promise.any(attempts);
+      this.logger.log(`NIP-46 response sent for ${method} to ${clientPubkey.slice(0, 12)}...`);
     } catch (err) {
       this.logger.error(`Failed to publish NIP-46 response: ${err}`);
+    }
+  }
+
+  /**
+   * Once every relay has settled, report the ones that refused a reply or sat on it. The reply is
+   * already on its way (Promise.any resolves at the first acceptance), so this never delays it; it
+   * makes visible what "response sent" hides: a client listening only on a relay that rejected or
+   * delayed the reply is still waiting.
+   */
+  private async reportPublishOutcome(
+    method: string,
+    relays: string[],
+    attempts: Promise<string>[],
+    started: number,
+  ) {
+    const outcomes = await Promise.all(
+      attempts.map((attempt, i) =>
+        attempt.then(
+          () => ({ relay: relays[i] ?? '?', ok: true, ms: Date.now() - started, why: '' }),
+          (err: unknown) => ({
+            relay: relays[i] ?? '?',
+            ok: false,
+            ms: Date.now() - started,
+            why: printable(err),
+          }),
+        ),
+      ),
+    );
+    const parts = outcomes.map(
+      (o) => `${o.relay.replace('wss://', '')} ${o.ok ? 'ok' : `failed (${o.why})`} ${o.ms}ms`,
+    );
+    const summary = parts.join(', ');
+    if (outcomes.some((o) => !o.ok || o.ms > SLOW_PUBLISH_MS)) {
+      this.logger.warn(`NIP-46 ${method} reply publish: ${summary}`);
+    } else {
+      this.logger.debug(`NIP-46 ${method} reply publish: ${summary}`);
     }
   }
 

@@ -20,6 +20,16 @@ export const Nip46RequestSchema = z.object({
 });
 export type Nip46Request = z.infer<typeof Nip46RequestSchema>;
 
+/**
+ * Just enough of a request to answer it: NIP-46 says requests with unknown or unsupported methods
+ * MUST be replied with an error, so a request that fails Nip46RequestSchema only because of its
+ * method still gets a reply.
+ */
+export const Nip46RequestEnvelopeSchema = z.object({
+  id: z.string().min(1).max(128),
+  method: z.string().min(1).max(64),
+});
+
 export const Nip46ResponseSchema = z.object({
   id: z.string(),
   result: z.string().optional(),
