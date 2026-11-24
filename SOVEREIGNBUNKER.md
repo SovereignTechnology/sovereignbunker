@@ -7,14 +7,14 @@ back as pull requests, and keep the diff small.
 
 ## Where it lives
 
-| What                                   | Where                                                  |
-| -------------------------------------- | ------------------------------------------------------ |
-| Canonical repo (CI, merges, releases)  | GitLab `sovtech/sovereignbunker`                       |
-| Public copy and upstream pull requests | https://github.com/SovereignTechnology/sovereignbunker |
-| Upstream                               | https://github.com/dsbaars/bunker46                    |
+| What                                                    | Where                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------ |
+| Origin: code, pull requests, CI, release tags           | https://github.com/SovereignTechnology/sovereignbunker |
+| Private mirror we also deploy through                   | GitLab `sovtech/sovereignbunker`                       |
+| Upstream                                                | https://github.com/dsbaars/bunker46                    |
 
-The public GitHub copy receives `main` and `sovtech-v*` release tags only. GitHub Actions is disabled there
-on purpose: CI and release builds run only in our own infrastructure (see below).
+GitHub is always pushed first and must never lag: GitLab only ever receives commits GitHub already has. Merges
+into `main` are done locally, never with GitHub's or GitLab's merge button.
 
 ## What differs from upstream
 
@@ -52,10 +52,18 @@ merge conflict:
 
 ## CI and releases
 
-- CI runs only as GitLab jobs in fresh Kata VMs on our home runners, never on rented hosts. The release
-  image is the one that holds our signing keys, so no third party gets to touch its build.
-- Release tags are `sovtech-v*`. A release pipeline builds the server and web OCI images from source and
-  publishes them with a `SHA256SUMS` file. Our deploy verifies each image against it before import.
+- CI is GitHub Actions, for build and test only (`.github/workflows/ci.yml`: lint, format, build, unit, migrations
+  and database integration, Playwright e2e). It runs on pushes to `main` and on every pull request, with a
+  read-only token and no secrets.
+- Every action is pinned to a commit SHA, and the repository setting that requires SHA pinning is on, so an
+  unpinned action (for example one that arrives with an upstream merge) fails loudly: re-pin it. Only
+  GitHub-owned actions plus the few named in the allow-list may run.
+- Release tags are `sovtech-vMAJOR.MINOR.PATCH` and must point at a commit already in `main`. The tag runs
+  `.github/workflows/sovtech-release.yml`: CI first (through `workflow_call`), then the server and web OCI images
+  are built from source and uploaded as an artifact with `SHA256SUMS`. Nothing is pushed to a registry.
+- Our deploy imports the images by digest, and only after checking each tar against the sums printed in that run's
+  log (not the artifact's own file).
+- Never a network service, a tunnel or an idle job on GitHub's runners.
 
 ## License
 
