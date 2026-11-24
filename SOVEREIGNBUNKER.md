@@ -7,11 +7,11 @@ back as pull requests, and keep the diff small.
 
 ## Where it lives
 
-| What                                                    | Where                                                  |
-| ------------------------------------------------------- | ------------------------------------------------------ |
-| Origin: code, pull requests, CI, release tags           | https://github.com/SovereignTechnology/sovereignbunker |
-| Private mirror we also deploy through                   | GitLab `sovtech/sovereignbunker`                       |
-| Upstream                                                | https://github.com/dsbaars/bunker46                    |
+| What                                          | Where                                                  |
+| --------------------------------------------- | ------------------------------------------------------ |
+| Origin: code, pull requests, CI, release tags | https://github.com/SovereignTechnology/sovereignbunker |
+| Private mirror we also deploy through         | GitLab `sovtech/sovereignbunker`                       |
+| Upstream                                      | https://github.com/dsbaars/bunker46                    |
 
 GitHub is always pushed first and must never lag: GitLab only ever receives commits GitHub already has. Merges
 into `main` are done locally, never with GitHub's or GitLab's merge button.
