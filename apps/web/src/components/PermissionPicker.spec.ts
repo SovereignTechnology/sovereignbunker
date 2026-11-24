@@ -86,6 +86,24 @@ describe('PermissionPicker', () => {
       await w.get('[data-testid="perm-add-kind"]').trigger('click');
       expect(permissions.value).toEqual([{ method: 'sign_event', kind: 30078 }]);
     });
+
+    it('rejects a kind that is not plain digits instead of reading its prefix', async () => {
+      const { w, permissions } = mountPicker([]);
+      const input = w.get('[data-testid="perm-kind-input"]');
+      for (const bad of ['1e3', '1.5', '12abc', '0x10', '99999999999']) {
+        await input.setValue(bad);
+        await w.get('[data-testid="perm-add-kind"]').trigger('click');
+      }
+      expect(permissions.value).toEqual([]);
+    });
+
+    it('stops adding kinds at the server limit of 64 entries', async () => {
+      const full = Array.from({ length: 64 }, (_, i) => ({ method: 'sign_event', kind: i }));
+      const { w, permissions } = mountPicker(full);
+      await w.get('[data-testid="perm-kind-input"]').setValue('5000');
+      await w.get('[data-testid="perm-add-kind"]').trigger('click');
+      expect(permissions.value).toHaveLength(64);
+    });
   });
 
   describe('Login (kind 27235) preset', () => {

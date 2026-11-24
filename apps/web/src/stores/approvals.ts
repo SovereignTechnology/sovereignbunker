@@ -14,10 +14,22 @@ const SAFETY_POLL_MS = 30_000;
 const FALLBACK_POLL_MS = 5_000;
 const RECONNECT_MS = 30_000;
 
+// A refresh applies only if no newer one has landed and the watch it started under is still the
+// current one, so a slow old answer can neither restore a resolved approval nor leak into the next
+// login in the same tab.
+let startedSeq = 0;
+let appliedSeq = 0;
+let session = 0;
+
 /** Reload the list. Keeps the last known list when the request fails (e.g. a brief outage). */
 async function refreshApprovals(): Promise<boolean> {
+  const seq = ++startedSeq;
+  const startedIn = session;
   try {
     const res = await api.get<{ approvals: PendingApprovalDto[] }>('/approvals');
+    if (startedIn !== session) return false;
+    if (seq < appliedSeq) return true;
+    appliedSeq = seq;
     $approvals.set(res.approvals);
     $approvalsLoaded.set(true);
     return true;
@@ -72,6 +84,7 @@ function startApprovalWatch() {
 
 function stopApprovalWatch() {
   watching = false;
+  session += 1;
   stopStream?.();
   stopStream = null;
   if (pollTimer) clearInterval(pollTimer);

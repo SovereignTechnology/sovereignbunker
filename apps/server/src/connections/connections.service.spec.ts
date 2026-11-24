@@ -333,6 +333,7 @@ describe('ConnectionsService', () => {
           { connectionId: 'conn-1', method: 'sign_event', kind: 1, allowed: true },
           { connectionId: 'conn-1', method: 'ping', kind: null, allowed: true },
         ],
+        skipDuplicates: true,
       });
     });
   });

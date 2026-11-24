@@ -3,6 +3,7 @@ import { computed, ref } from 'vue';
 import {
   GATED_PERMISSION_METHODS,
   LOGIN_EVENT_KIND,
+  MAX_PERMISSIONS_PER_REQUEST,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
 import Button from '@/components/ui/Button.vue';
@@ -56,8 +57,12 @@ function revokeAll() {
 }
 
 function addKind() {
-  const kind = Number.parseInt(newKind.value, 10);
-  if (!Number.isInteger(kind) || kind < 0) return;
+  // Digits only: parseInt would read "1e3" or "1.5" as kind 1.
+  const raw = newKind.value.trim();
+  if (!/^\d{1,9}$/.test(raw)) return;
+  const kind = Number(raw);
+  // The server refuses a list over its limit, so stop at it here instead of failing on save.
+  if (permissions.value.length >= MAX_PERMISSIONS_PER_REQUEST) return;
   const exists = permissions.value.some(
     (p) => p.method === 'sign_event' && (p.kind == null || p.kind === kind),
   );

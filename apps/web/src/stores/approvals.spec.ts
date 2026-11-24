@@ -67,6 +67,38 @@ describe('approvals store', () => {
     });
   });
 
+  describe('overlapping refreshes', () => {
+    const deferred = () => {
+      let resolve!: (v: unknown) => void;
+      const promise = new Promise((r) => (resolve = r));
+      return { promise, resolve };
+    };
+
+    it('an older answer that lands last does not replace a newer one', async () => {
+      const older = deferred();
+      const newer = deferred();
+      apiGet.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+      const first = refreshApprovals();
+      const second = refreshApprovals();
+      newer.resolve(reply('new'));
+      await second;
+      older.resolve(reply('old', 'stale'));
+      await expect(first).resolves.toBe(true);
+      expect($approvals.get().map((a) => a.token)).toEqual(['new']);
+    });
+
+    it('an answer that started before the watch stopped is dropped', async () => {
+      const slow = deferred();
+      apiGet.mockReturnValueOnce(slow.promise);
+      const pending = refreshApprovals();
+      stopApprovalWatch();
+      slow.resolve(reply('previous-session'));
+      await expect(pending).resolves.toBe(false);
+      expect($approvals.get()).toEqual([]);
+      expect($approvalsLoaded.get()).toBe(false);
+    });
+  });
+
   describe('watching', () => {
     it('loads at once and opens one stream; starting twice changes nothing', async () => {
       apiGet.mockResolvedValue(reply('a'));

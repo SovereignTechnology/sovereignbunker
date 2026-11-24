@@ -68,8 +68,13 @@ function isMethodAllKinds(method: string) {
 
 const wirePerm = (p: Perm) => ({ method: p.method, ...(p.kind != null ? { kind: p.kind } : {}) });
 
+// Only the latest reload may apply: an activity-triggered GET that started before a permission change
+// must not land after it and bring the old list (and a revoked grant) back.
+let latestReload = 0;
 async function reloadConnection() {
-  connection.value = await api.get(`/connections/${route.params.id}`);
+  const seq = ++latestReload;
+  const fresh = await api.get<any>(`/connections/${route.params.id}`);
+  if (seq === latestReload) connection.value = fresh;
 }
 
 // Replace the GRANTED whitelist; the backend preserves any pending requests.
@@ -557,6 +562,7 @@ function formatTime(ts: string) {
                 <button
                   type="button"
                   data-testid="approval-mode-toggle"
+                  aria-label="Ask me instead of refusing"
                   :aria-pressed="connection.approvalMode === 'ASK'"
                   :class="[
                     'w-12 h-6 rounded-full transition-colors cursor-pointer relative shrink-0',

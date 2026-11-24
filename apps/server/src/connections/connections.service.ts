@@ -247,6 +247,8 @@ export class ConnectionsService {
         kind: p.kind ?? null,
         allowed: true,
       })),
+      // A concurrent approval of the same request may have created the row first.
+      skipDuplicates: true,
     });
     await this.eventsService.publishUserActivity(userId);
   }

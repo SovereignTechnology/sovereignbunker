@@ -247,8 +247,15 @@ async function importConnection() {
   creating.value = true;
   error.value = '';
 
+  // Read everything the operator reviewed before the first await: the URI watcher may replace the
+  // picker's list while the parse request is pending, and it must not be paired with this client.
+  const uri = bunkerUri.value;
+  const keyId = selectedKeyId.value;
+  const permissions = importPerms.value.map((p) => ({ ...p }));
+  const approvalMode = importAsk.value ? 'ASK' : 'DENY';
+
   try {
-    const parsed = await api.post<any>('/bunker/parse-uri', { uri: bunkerUri.value });
+    const parsed = await api.post<any>('/bunker/parse-uri', { uri });
     if (parsed.type === 'invalid') {
       error.value = parsed.error || 'Invalid URI';
       return;
@@ -260,7 +267,7 @@ async function importConnection() {
         : parsed.pubkey || '';
 
     await api.post('/connections', {
-      nsecKeyId: selectedKeyId.value,
+      nsecKeyId: keyId,
       clientPubkey,
       name: connectionName.value || parsed.name || 'Unnamed Connection',
       logoUrl: uriPreviewImage.value || parsed.image || undefined,
@@ -268,8 +275,8 @@ async function importConnection() {
       secret: parsed.secret,
       remotePubkey: parsed.type === 'bunker' ? parsed.pubkey : undefined,
       // Exactly what the picker shows, as a list: edited entries are what is granted.
-      permissions: importPerms.value,
-      approvalMode: importAsk.value ? 'ASK' : 'DENY',
+      permissions,
+      approvalMode,
       type: parsed.type,
     });
 
