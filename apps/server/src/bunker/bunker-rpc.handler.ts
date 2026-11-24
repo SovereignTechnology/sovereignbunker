@@ -6,6 +6,7 @@ import { EncryptionService } from '../common/crypto/encryption.service.js';
 import {
   checkPermission,
   parsePermissionList,
+  SafeRelayUrlSchema,
   type PermissionDescriptor,
   type Nip46Request,
   type Nip46Response,
@@ -28,6 +29,9 @@ export class BunkerRpcHandler {
     secret: string,
   ) => PendingSecretResult | undefined;
 
+  /** The owner's relay set (relay_configs, else the defaults), as the listeners resolve it. */
+  private baseRelayLookup?: (userId: string) => Promise<string[]>;
+
   constructor(
     private readonly connections: ConnectionsService,
     private readonly loggingService: LoggingService,
@@ -39,6 +43,10 @@ export class BunkerRpcHandler {
     fn: (signerPubkey: string, secret: string) => PendingSecretResult | undefined,
   ) {
     this.pendingSecretLookup = fn;
+  }
+
+  setBaseRelayLookup(fn: (userId: string) => Promise<string[]>) {
+    this.baseRelayLookup = fn;
   }
 
   async handleRequest(
@@ -236,7 +244,15 @@ export class BunkerRpcHandler {
         }
 
         case 'switch_relays': {
-          result = connection.relays.length > 0 ? JSON.stringify(connection.relays) : 'null';
+          // NIP-46: answer with the relays the signer listens on for this session, so the client
+          // can follow them. A bunker:// session stores no relays of its own and its URI froze the
+          // relay set of the day it paired, so answering only the stored relays (null for every
+          // bunker:// session) left those clients on that day's set however it changed since.
+          const base = this.baseRelayLookup ? await this.baseRelayLookup(connection.userId) : [];
+          const relays = [...new Set([...connection.relays, ...base])].filter(
+            (url) => SafeRelayUrlSchema.safeParse(url).success,
+          );
+          result = relays.length > 0 ? JSON.stringify(relays) : 'null';
           break;
         }
 
