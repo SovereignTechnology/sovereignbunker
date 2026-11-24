@@ -20,7 +20,7 @@
     "lint:security": "pnpm -r run lint:security",
     "format": "prettier --write \"**/*.{ts,vue,json,md,yaml}\"",
     "format:check": "prettier --check \"**/*.{ts,vue,json,md,yaml}\"",
-    "test": "pnpm -r run test",
+    "test": "pnpm -r --no-bail run test",
     "test:coverage": "pnpm -r run test:coverage",
     "e2e": "pnpm --filter @bunker46/web run e2e",
     "e2e:ui": "pnpm --filter @bunker46/web run e2e:ui",
