@@ -613,7 +613,10 @@ describe('BunkerService', () => {
 
     it('starts the backoff over once a subscription stayed open for a minute', async () => {
       vi.useFakeTimers();
-      const { svc, subscribe, paramsOf } = await makeService();
+      // The relay's socket is up, so the watchdog leaves the subscription alone while it stays open.
+      const { svc, subscribe, paramsOf } = await makeService(
+        new Map([['wss://r1.example.com/', true]]),
+      );
       svc.startListeningForKey(PK, NSEC, ['wss://r1.example.com']);
       const closed = [{ url: 'wss://r1.example.com/', reason: 'error: shutting down' }];
 
