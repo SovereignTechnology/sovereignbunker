@@ -23,6 +23,8 @@ import { BunkerService } from '../bunker/bunker.service.js';
 import { ApprovalService } from '../bunker/approval.service.js';
 import {
   ApprovalModeSchema,
+  ApprovePermissionsBodySchema,
+  DenyPermissionsBodySchema,
   PermissionListSchema,
   SafeRelayUrlsSchema,
   SetApprovalModeBodySchema,
@@ -196,27 +198,62 @@ export class ConnectionsController {
     return { success: true };
   }
 
-  // Approve client-requested (pending) permissions; omit `permissions` to approve all pending.
+  // Approve exactly these client-requested (pending) permissions. A list is required: an empty or
+  // missing one is an error, never "all" (see approve-all). `confirm: true` is required for any
+  // that is not an ordinary kind.
   @Post(':id/permissions/approve')
   @HttpCode(HttpStatus.OK)
   async approvePermissionRequests(
     @Req() req: AuthReq,
     @Param('id') id: string,
-    @Body() body: { permissions?: PermissionDescriptor[] },
+    @Body() body: unknown,
   ) {
-    await this.connectionsService.approveRequests(id, req.user.sub, body?.permissions);
+    const parsed = ApprovePermissionsBodySchema.safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException(
+        'permissions must be a non-empty list of valid permissions (approve-all approves every ordinary request)',
+      );
+    }
+    await this.connectionsService.approveRequests(
+      id,
+      req.user.sub,
+      parsed.data.permissions,
+      parsed.data.confirm === true,
+    );
     return { success: true };
   }
 
-  // Deny (delete) client-requested (pending) permissions; omit `permissions` to deny all pending.
+  // Approve every pending request that is an ordinary kind; the others stay pending (and are counted).
+  @Post(':id/permissions/approve-all')
+  @HttpCode(HttpStatus.OK)
+  async approveAllPermissionRequests(@Req() req: AuthReq, @Param('id') id: string) {
+    const result = await this.connectionsService.approveAllRequests(id, req.user.sub);
+    return { success: true, ...result };
+  }
+
+  // Deny (delete) exactly these client-requested (pending) permissions. A list is required.
   @Post(':id/permissions/deny')
   @HttpCode(HttpStatus.OK)
   async denyPermissionRequests(
     @Req() req: AuthReq,
     @Param('id') id: string,
-    @Body() body: { permissions?: PermissionDescriptor[] },
+    @Body() body: unknown,
   ) {
-    await this.connectionsService.denyRequests(id, req.user.sub, body?.permissions);
+    const parsed = DenyPermissionsBodySchema.safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException(
+        'permissions must be a non-empty list of valid permissions (deny-all denies every pending request)',
+      );
+    }
+    await this.connectionsService.denyRequests(id, req.user.sub, parsed.data.permissions);
+    return { success: true };
+  }
+
+  // Deny (delete) every pending request.
+  @Post(':id/permissions/deny-all')
+  @HttpCode(HttpStatus.OK)
+  async denyAllPermissionRequests(@Req() req: AuthReq, @Param('id') id: string) {
+    await this.connectionsService.denyRequests(id, req.user.sub);
     return { success: true };
   }
 

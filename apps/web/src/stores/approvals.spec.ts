@@ -145,7 +145,37 @@ describe('approvals store', () => {
       expect($pendingApprovalCount.get()).toBe(3);
     });
 
-    it('a burst of activity events is ONE reload: a client spamming ping cannot push the page past its rate limit', async () => {
+    it('a steady stream of events still refreshes about once a second: it cannot starve the list (a throttle, not a debounce)', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      await flush();
+      apiGet.mockClear();
+      // A busy client: an event every 500 ms for ten seconds. A timer that restarts on every event
+      // would never fire until the events stopped, and the list would not move.
+      for (let i = 0; i < 20; i++) {
+        streams[0]!.handlers.onActivity();
+        await vi.advanceTimersByTimeAsync(500);
+      }
+      expect(apiGet.mock.calls.length).toBeGreaterThanOrEqual(9);
+      expect(apiGet.mock.calls.length).toBeLessThanOrEqual(11);
+    });
+
+    it('the first event of a run waits one second, and later ones in that second do not push it back', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      await flush();
+      apiGet.mockResolvedValue(reply('x'));
+      streams[0]!.handlers.onActivity();
+      await vi.advanceTimersByTimeAsync(900);
+      streams[0]!.handlers.onActivity();
+      await vi.advanceTimersByTimeAsync(99);
+      expect($pendingApprovalCount.get()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      // One second after the FIRST event, although another came 100 ms before.
+      expect($pendingApprovalCount.get()).toBe(1);
+    });
+
+    it('a burst of activity events is a handful of reloads, never one per event: a client spamming ping cannot push the page past its rate limit', async () => {
       apiGet.mockResolvedValue(reply());
       startApprovalWatch();
       await flush();
@@ -155,10 +185,22 @@ describe('approvals store', () => {
         await vi.advanceTimersByTimeAsync(10);
       }
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(apiGet).toHaveBeenCalledTimes(1);
+      // 200 events over two seconds: one reload per second.
+      expect(apiGet.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(apiGet.mock.calls.length).toBeLessThanOrEqual(3);
     });
 
-    it('a debounced reload does not outlive the watch', async () => {
+    it('a quiet stream costs nothing: no event, no reload', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      streams[0]!.handlers.onOpen?.();
+      await flush();
+      apiGet.mockClear();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(apiGet).not.toHaveBeenCalled();
+    });
+
+    it('a pending reload does not outlive the watch', async () => {
       apiGet.mockResolvedValue(reply());
       startApprovalWatch();
       await flush();
@@ -167,6 +209,20 @@ describe('approvals store', () => {
       stopApprovalWatch();
       await vi.advanceTimersByTimeAsync(5_000);
       expect(apiGet).not.toHaveBeenCalled();
+    });
+
+    it('after a watch is stopped and restarted, an event arms a fresh timer', async () => {
+      apiGet.mockResolvedValue(reply());
+      startApprovalWatch();
+      await flush();
+      streams[0]!.handlers.onActivity();
+      stopApprovalWatch();
+      startApprovalWatch();
+      await flush();
+      apiGet.mockClear();
+      streams[1]!.handlers.onActivity();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(apiGet).toHaveBeenCalledTimes(1);
     });
 
     it('polls only slowly while the stream is up', async () => {

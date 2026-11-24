@@ -22,10 +22,12 @@ const FALLBACK_POLL_MS = 5_000;
 const RECONNECT_MS = 30_000;
 /**
  * Every signing request the server handles is an activity event, and every open tab refreshes on it:
- * a client sending `ping` in a loop must not become a request storm. Events within this window are
- * ONE refresh, taken after the last of them.
+ * a client sending `ping` in a loop must not become a request storm. A THROTTLE, not a debounce: the
+ * first event starts a timer and the refresh happens when it fires, however many events came
+ * meanwhile. A debounce restarts on every event, so a client sending a `ping` every half second
+ * would postpone the refresh for ever and the list would only move on the slow safety poll.
  */
-const ACTIVITY_DEBOUNCE_MS = 1_000;
+const ACTIVITY_THROTTLE_MS = 1_000;
 
 // A refresh applies only if no newer one has landed and the watch it started under is still the
 // current one, so a slow old answer can neither restore a resolved approval nor leak into the next
@@ -66,11 +68,12 @@ let activityTimer: ReturnType<typeof setTimeout> | null = null;
 let watching = false;
 
 function refreshSoon() {
-  if (activityTimer) clearTimeout(activityTimer);
+  // A refresh is already due: this event is covered by it. Never push it back.
+  if (activityTimer) return;
   activityTimer = setTimeout(() => {
     activityTimer = null;
     if (watching) void refreshApprovals();
-  }, ACTIVITY_DEBOUNCE_MS);
+  }, ACTIVITY_THROTTLE_MS);
 }
 
 function setPolling(ms: number) {

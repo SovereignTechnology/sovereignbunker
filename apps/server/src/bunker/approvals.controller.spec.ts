@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { ApprovalsController } from './approvals.controller.js';
 import { ApprovalService, type HeldRequest } from './approval.service.js';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
@@ -22,7 +22,9 @@ describe('ApprovalsController', () => {
   let controller: ApprovalsController;
   let hold: HeldRequest;
 
-  const open = (over: { userId?: string; kind?: number; requestId?: string } = {}) =>
+  const open = (
+    over: { userId?: string; kind?: number; requestId?: string; method?: string } = {},
+  ) =>
     approvals.open({
       userId: over.userId ?? 'user-1',
       connectionId: 'conn-1',
@@ -30,7 +32,10 @@ describe('ApprovalsController', () => {
       clientPubkey: 'c'.repeat(64),
       requestId: over.requestId ?? 'req-1',
       fingerprint: 'fp',
-      permission: { method: 'sign_event', kind: over.kind ?? 27235 },
+      permission:
+        over.method && over.method !== 'sign_event'
+          ? ({ method: over.method } as never)
+          : { method: 'sign_event', kind: over.kind ?? 27235 },
     })!;
 
   const settled = async (h: HeldRequest) =>
@@ -131,6 +136,7 @@ describe('ApprovalsController', () => {
       ['a non-string mode', { mode: 1 }],
       ['an extra field', { mode: 'once', also: 'this' }],
       ['a case-variant mode', { mode: 'ONCE' }],
+      ['a confirm that is not a boolean', { mode: 'always', confirm: 'yes' }],
     ])('rejects %s with 400 and decides nothing', async (_name, body) => {
       await expect(controller.approve(as('user-1'), hold.token, body)).rejects.toThrow(
         BadRequestException,
@@ -162,7 +168,7 @@ describe('ApprovalsController', () => {
         heldWhenGranted = approvals.size;
       });
 
-      await controller.approve(as('user-1'), hold.token, { mode: 'always' });
+      await controller.approve(as('user-1'), hold.token, { mode: 'always', confirm: true });
 
       expect(connections.grantPermissions).toHaveBeenCalledWith('conn-1', 'user-1', [
         { method: 'sign_event', kind: 27235 },
@@ -175,14 +181,14 @@ describe('ApprovalsController', () => {
     it('always: when the grant fails the request is NOT approved and stays held', async () => {
       connections.grantPermissions.mockRejectedValue(new NotFoundException('Connection not found'));
       await expect(
-        controller.approve(as('user-1'), hold.token, { mode: 'always' }),
+        controller.approve(as('user-1'), hold.token, { mode: 'always', confirm: true }),
       ).rejects.toThrow(NotFoundException);
       expect(await settled(hold)).toBe('pending');
     });
 
     it("another user's token: 404, nothing granted, the hold untouched", async () => {
       await expect(
-        controller.approve(as('user-2'), hold.token, { mode: 'always' }),
+        controller.approve(as('user-2'), hold.token, { mode: 'always', confirm: true }),
       ).rejects.toThrow(NotFoundException);
       expect(connections.grantPermissions).not.toHaveBeenCalled();
       expect(await settled(hold)).toBe('pending');
@@ -200,7 +206,7 @@ describe('ApprovalsController', () => {
         vi.advanceTimersByTime(100_000);
       });
       await expect(
-        controller.approve(as('user-1'), hold.token, { mode: 'always' }),
+        controller.approve(as('user-1'), hold.token, { mode: 'always', confirm: true }),
       ).resolves.toEqual({ success: true });
       expect(connections.grantPermissions).toHaveBeenCalledTimes(1);
       expect(await hold.decision).toBe('expired');
@@ -208,11 +214,81 @@ describe('ApprovalsController', () => {
 
     it('always only covers the kind that was asked, not the whole method', async () => {
       const other = open({ kind: 1, requestId: 'r2' });
-      await controller.approve(as('user-1'), hold.token, { mode: 'always' });
+      await controller.approve(as('user-1'), hold.token, { mode: 'always', confirm: true });
       expect(connections.grantPermissions).toHaveBeenCalledWith('conn-1', 'user-1', [
         { method: 'sign_event', kind: 27235 },
       ]);
       expect(await settled(other)).toBe('pending');
+    });
+  });
+
+  describe("the confirmation is the SERVER's gate, not only the page's", () => {
+    // Every one of these is a permanent grant of something wide.
+    const wide: Array<[string, { method?: string; kind?: number }]> = [
+      ['sign_event:0 (profile)', { kind: 0 }],
+      ['sign_event:3 (follow list)', { kind: 3 }],
+      ['sign_event:4 (direct message)', { kind: 4 }],
+      ['sign_event:5 (deletion)', { kind: 5 }],
+      ['sign_event:13 (seal)', { kind: 13 }],
+      ['sign_event:9734 (zap request)', { kind: 9734 }],
+      ['sign_event:10002 (relay list)', { kind: 10002 }],
+      ['sign_event:22242 (relay auth)', { kind: 22242 }],
+      ['sign_event:23194 (wallet connect)', { kind: 23194 }],
+      ['sign_event:24133 (remote signer)', { kind: 24133 }],
+      ['sign_event:24242 (Blossom)', { kind: 24242 }],
+      ['sign_event:27235 (HTTP auth)', { kind: 27235 }],
+      ['nip04_encrypt', { method: 'nip04_encrypt' }],
+      ['nip04_decrypt', { method: 'nip04_decrypt' }],
+      ['nip44_encrypt', { method: 'nip44_encrypt' }],
+      ['nip44_decrypt', { method: 'nip44_decrypt' }],
+    ];
+
+    it.each(wide)(
+      'always on %s without confirm is a 409: nothing is granted and the hold stays',
+      async (_name, over) => {
+        approvals.cancelForConnection('conn-1');
+        const h = open({ ...over, requestId: 'wide' });
+        await expect(controller.approve(as('user-1'), h.token, { mode: 'always' })).rejects.toThrow(
+          ConflictException,
+        );
+        await expect(
+          controller.approve(as('user-1'), h.token, { mode: 'always', confirm: false }),
+        ).rejects.toThrow(ConflictException);
+        expect(connections.grantPermissions).not.toHaveBeenCalled();
+        expect(await settled(h)).toBe('pending');
+      },
+    );
+
+    it('says what it refused and how to proceed', async () => {
+      await expect(
+        controller.approve(as('user-1'), hold.token, { mode: 'always' }),
+      ).rejects.toThrow(/sign_event:27235.*confirm: true/);
+    });
+
+    it.each(wide)('always on %s WITH confirm is granted', async (_name, over) => {
+      approvals.cancelForConnection('conn-1');
+      const h = open({ ...over, requestId: 'wide' });
+      await controller.approve(as('user-1'), h.token, { mode: 'always', confirm: true });
+      expect(connections.grantPermissions).toHaveBeenCalledTimes(1);
+      expect(await h.decision).toBe('approved_always');
+    });
+
+    it.each([1, 6, 7, 16])('always on the ordinary kind %i needs no confirm', async (kind) => {
+      approvals.cancelForConnection('conn-1');
+      const h = open({ kind, requestId: 'plain' });
+      await controller.approve(as('user-1'), h.token, { mode: 'always' });
+      expect(connections.grantPermissions).toHaveBeenCalledWith('conn-1', 'user-1', [
+        { method: 'sign_event', kind },
+      ]);
+      expect(await h.decision).toBe('approved_always');
+    });
+
+    it.each(wide)('once on %s never needs a confirm: it grants nothing', async (_name, over) => {
+      approvals.cancelForConnection('conn-1');
+      const h = open({ ...over, requestId: 'once' });
+      await controller.approve(as('user-1'), h.token, { mode: 'once' });
+      expect(connections.grantPermissions).not.toHaveBeenCalled();
+      expect(await h.decision).toBe('approved_once');
     });
   });
 

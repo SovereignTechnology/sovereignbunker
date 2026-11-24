@@ -69,10 +69,33 @@ describe('ConnectionsView: importing a nostrconnect:// URI', () => {
     $approvalsCanAsk.set(true);
   });
 
-  it('pre-selects the kinds the URI asked for, and shows it before anything is granted', async () => {
+  it('pre-selects the ordinary kinds the URI asked for, and shows it before anything is granted', async () => {
     const w = await mountView();
-    await openImport(w, 'sign_event:1,sign_event:27235');
-    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:27235']);
+    await openImport(w, 'sign_event:1,sign_event:7');
+    expect(chips(w)).toEqual(['sign_event:1', 'sign_event:7']);
+    expect(w.find('[data-testid="uri-flagged"]').exists()).toBe(false);
+  });
+
+  it('does NOT tick a login, a profile or a relay auth a link asks for: it flags them as needing confirmation', async () => {
+    const w = await mountView();
+    await openImport(w, 'sign_event:1,sign_event:27235,sign_event:0,sign_event:22242');
+    expect(chips(w)).toEqual(['sign_event:1']);
+    const note = w.get('[data-testid="uri-flagged"]').text();
+    expect(note).toContain('sign_event:27235');
+    expect(note).toContain('sign_event:0');
+    expect(note).toContain('sign_event:22242');
+    expect(note).toContain('need your confirmation');
+  });
+
+  it('a login the link asked for is still sent as "ask each time", not as a grant', async () => {
+    const w = await mountView();
+    await openImport(w, 'sign_event:27235');
+    await button(w, 'Create Connection').trigger('click');
+    await flushPromises();
+    const [, body] = connectionsPost()! as [string, { permissions: unknown[] }];
+    expect(body.permissions).not.toContainEqual({ method: 'sign_event', kind: 27235 });
+    // Asking is on by default, so the login arrives as a request the operator answers each time.
+    expect((body as Record<string, unknown>)['approvalMode']).toBe('ASK');
   });
 
   it('does not tick what a link asks for beyond kinds, but says it asked', async () => {
@@ -105,13 +128,13 @@ describe('ConnectionsView: importing a nostrconnect:// URI', () => {
 
   it('grants exactly what the operator left in the picker, after editing it', async () => {
     const w = await mountView();
-    await openImport(w, 'sign_event:1,sign_event:27235,sign_event:7');
+    await openImport(w, 'sign_event:1,sign_event:6,sign_event:7');
 
-    // The operator drops the login the app asked for.
-    const login = w
+    // The operator drops the repost the app asked for.
+    const repost = w
       .findAll('[data-testid="perm-chip"]')
-      .find((c) => c.text().includes('sign_event:27235'))!;
-    await login.get('button').trigger('click');
+      .find((c) => c.text().includes('sign_event:6'))!;
+    await repost.get('button').trigger('click');
     expect(chips(w)).toEqual(['sign_event:1', 'sign_event:7']);
 
     await button(w, 'Create Connection').trigger('click');

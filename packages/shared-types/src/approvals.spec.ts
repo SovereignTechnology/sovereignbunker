@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   ApprovalModeSchema,
+  ApprovePermissionsBodySchema,
   ApproveApprovalBodySchema,
+  DenyPermissionsBodySchema,
   PermissionListSchema,
   SetApprovalModeBodySchema,
 } from './approvals';
@@ -38,8 +40,74 @@ describe('ApproveApprovalBodySchema', () => {
     ['a different case', { mode: 'ONCE' }],
     ['a number', { mode: 1 }],
     ['an extra field next to a valid mode', { mode: 'once', connectionId: 'x' }],
+    ['a confirm that is a string', { mode: 'always', confirm: 'true' }],
+    ['a confirm that is a number', { mode: 'always', confirm: 1 }],
+    ['a null confirm', { mode: 'always', confirm: null }],
   ])('rejects %s', (_name, body) => {
     expect(ApproveApprovalBodySchema.safeParse(body).success).toBe(false);
+  });
+
+  it('accepts a boolean confirm next to a mode', () => {
+    expect(ApproveApprovalBodySchema.parse({ mode: 'always', confirm: true })).toEqual({
+      mode: 'always',
+      confirm: true,
+    });
+    expect(ApproveApprovalBodySchema.parse({ mode: 'once', confirm: false })).toEqual({
+      mode: 'once',
+      confirm: false,
+    });
+  });
+});
+
+describe.each([
+  ['ApprovePermissionsBodySchema', ApprovePermissionsBodySchema],
+  ['DenyPermissionsBodySchema', DenyPermissionsBodySchema],
+])('%s', (_name, schema) => {
+  it('accepts a list of valid permissions', () => {
+    const permissions = [{ method: 'sign_event', kind: 1 }, { method: 'nip44_decrypt' }];
+    expect(schema.parse({ permissions })).toEqual({ permissions });
+  });
+
+  it.each([
+    ['no body', undefined],
+    ['null', null],
+    ['an empty object: it must never mean "all"', {}],
+    ['an empty list: it must never mean "all"', { permissions: [] }],
+    ['a list that is not a list', { permissions: 'sign_event' }],
+    ['a kind beyond 65535', { permissions: [{ method: 'sign_event', kind: 3_000_000_000 }] }],
+    ['a fractional kind', { permissions: [{ method: 'sign_event', kind: 1.5 }] }],
+    ['a negative kind', { permissions: [{ method: 'sign_event', kind: -1 }] }],
+    ['a filter object as a kind', { permissions: [{ method: 'sign_event', kind: { gte: 0 } }] }],
+    ['an unknown method', { permissions: [{ method: 'delete_everything' }] }],
+    ['an extra field', { permissions: [{ method: 'sign_event', kind: 1 }], all: true }],
+    [
+      'more than the per-request limit',
+      {
+        permissions: Array.from({ length: MAX_PERMISSIONS_PER_REQUEST + 1 }, (_v, kind) => ({
+          method: 'sign_event',
+          kind,
+        })),
+      },
+    ],
+  ])('rejects %s', (_n, body) => {
+    expect(schema.safeParse(body).success).toBe(false);
+  });
+});
+
+describe('ApprovePermissionsBodySchema confirm', () => {
+  const permissions = [{ method: 'sign_event', kind: 27235 }];
+
+  it('is optional, and a boolean when given', () => {
+    expect(ApprovePermissionsBodySchema.parse({ permissions }).confirm).toBeUndefined();
+    expect(ApprovePermissionsBodySchema.parse({ permissions, confirm: true }).confirm).toBe(true);
+  });
+
+  it.each(['true', 1, null])('rejects confirm: %j', (confirm) => {
+    expect(ApprovePermissionsBodySchema.safeParse({ permissions, confirm }).success).toBe(false);
+  });
+
+  it('the deny body takes no confirm at all', () => {
+    expect(DenyPermissionsBodySchema.safeParse({ permissions, confirm: true }).success).toBe(false);
   });
 });
 

@@ -211,17 +211,37 @@ permanent grant). _Always allow_ stores the permission, so the next request need
 
 The Approvals page shows what is being asked, as plain text: for a signature the kind, the content (with its full length when cut) and **every tag with its
 first values**; for a login (kind 27235, NIP-98 HTTP auth, which is also what confirms deleting an account on many sites) the **host and path** of the
-URL it is for, the method and the payload; for an encrypt or decrypt, who it is with, the plaintext (encrypt) or the ciphertext length (decrypt).
-_Always allow_ takes a second, confirming click for any encrypt or decrypt and for kinds 5, 22242, 24133 and 27235, since each is a blanket grant.
-A card whose request has ended stays in place, greyed out, until you dismiss it, so the next card never moves under your pointer.
+URL it is for, the method and the payload; for an encrypt or decrypt, who it is with (as an npub), the plaintext (encrypt) or the ciphertext length (decrypt).
+Whatever is cut is said to be cut: a login URL longer than shown carries a red "URL longer than shown" note and takes a second click even for _Allow once_
+(a `u` longer than 2048 characters is not held at all, it is refused). The event's own date is shown, and flagged when it is more than a day from now;
+tag values that are not text are counted, not silently dropped. Invisible and look-alike characters (zero-width and bidi characters, the no-break and
+other space separators, the braille blank, variation selectors, ...) are replaced, so text cannot pass for something it is not.
+
+**Permanent grants need a confirmation, and the server enforces it.** _Always allow_ for anything but an ordinary kind (`sign_event` 1, 6, 7 and 16) is
+refused with `409` unless the request carries `{"mode": "always", "confirm": true}`; the page sends that after its second click. That covers every
+encrypt and decrypt and every other kind (a profile, a follow list, a seal, a zap request, wallet connect, Blossom, HTTP auth, deleting events, relay auth,
+remote-signer messages, ...): the list of what is dangerous would always be one entry short, so the list is of what is not.
+The connection page's pending requests follow the same rule: a client files those rows itself, so **Approve all** (`POST .../permissions/approve-all`)
+approves only ordinary kinds and says how many it left, and approving one of the others (`POST .../permissions/approve`, with a non-empty `permissions`
+list, never "all") needs `confirm: true` for that row. An empty or malformed list is a `400`.
+A nostrconnect:// URI pre-ticks only ordinary kinds; what else it asks for is listed as needing your confirmation and left unticked.
+
+A card whose request has ended stays in place, greyed out, until you dismiss it, and one you answered becomes a line of the same height, so the next card
+never moves under your pointer.
 
 Ask mode needs `PUBLIC_BASE_URL`: without it there is no link to send, so such a request is **refused at once** (and the "Ask me" options are switched off
-in the web UI, with the reason). A retry that carries the same request id as one still waiting shares that wait and is not sent a second `auth_url`;
+in the web UI, with the reason). A retry that carries the same request id as one still waiting shares that wait (one retry at most; more events under that id are ignored) and is not sent a
+second `auth_url` or a second answer;
 a request created before the signer started is never held (its client was already answered), so a restart does not re-ask.
+
+Known limits: granting a permission on the connection page (or by editing the list there) does not end the holds already waiting for it; they run out, or
+you answer them on the Approvals page.
 
 Only turn ask mode on for clients that understand `auth_url` (BIES and other nostr-tools based clients do). A client that does not
 will treat the interim reply as an answer or an error. Revoking, deleting or switching a connection back to refusing cancels its waiting requests.
-At most 10 requests wait per connection, 50 per user and 200 in total; past that, requests are refused as before. At most 50 pending permission rows are
+At most 10 requests wait per connection, 25 per user and 200 in total; past that, requests are refused as before. With open registration (`ALLOW_REGISTRATION`)
+the per-user cap is what keeps a few accounts from filling every hold: switch registration off on a deployment that uses ask mode. An encrypt or decrypt whose
+peer is not a public key, or whose payload is empty or very large, is refused rather than held. At most 50 pending permission rows are
 kept per connection (the oldest go first). Waiting requests live in memory, so a signer
 restart refuses them (the client can ask again).
 

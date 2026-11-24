@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -15,6 +16,8 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import {
   ApproveApprovalBodySchema,
+  formatPermission,
+  grantNeedsConfirmation,
   type PendingApprovalsDto,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
@@ -71,7 +74,9 @@ export class ApprovalsController {
 
   /**
    * `once` answers this request only. `always` also grants the permission to the connection (so the
-   * client is not asked again for that method and kind), then answers.
+   * client is not asked again for that method and kind), then answers. A permanent grant of anything
+   * but an ordinary kind must be confirmed (`confirm: true`): the page asks twice, but the page is
+   * not the gate, this is, so a call made directly cannot skip the second look.
    */
   @Post(':token/approve')
   @HttpCode(HttpStatus.OK)
@@ -87,6 +92,16 @@ export class ApprovalsController {
       method: held.method as PermissionDescriptor['method'],
       kind: held.kind,
     };
+
+    if (
+      parsed.data.mode === 'always' &&
+      parsed.data.confirm !== true &&
+      grantNeedsConfirmation(permission)
+    ) {
+      throw new ConflictException(
+        `Always allowing ${formatPermission(permission)} is a permanent, wide grant: send confirm: true to confirm it, or allow this request once`,
+      );
+    }
 
     if (parsed.data.mode === 'always') {
       // Granted before the hold is settled: the request is handled again after the wait and must

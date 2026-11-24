@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NotFoundException } from '@nestjs/common';
 import { APPROVAL_CONSTANTS } from '@bunker46/config';
+import { nip19 } from 'nostr-tools';
 import {
   ApprovalService,
+  holdBlocker,
   previewRequest,
   previewSignEvent,
   type OpenApprovalInput,
@@ -103,6 +105,35 @@ describe('ApprovalService', () => {
       expect(service.open(input({ requestId: 'last' }))).toBeDefined();
       // The connection is full, yet a retry of a request that is held still shares it.
       expect(service.open(input({ requestId: 'last' }))?.shared).toBe(true);
+    });
+
+    it('one retry may wait on a hold; any event beyond it is dropped, and still shares the one decision', async () => {
+      expect(APPROVAL_CONSTANTS.MAX_WAITERS_PER_HOLD).toBe(2);
+      const first = service.open(input())!;
+      const retry = service.open(input())!;
+      expect(retry.shared).toBe(true);
+      expect(retry.dropped).toBeFalsy();
+
+      // A client parking events under one id: none of them is another waiter.
+      for (let i = 0; i < 20; i++) {
+        const extra = service.open(input())!;
+        expect(extra.dropped).toBe(true);
+        expect(extra.shared).toBe(true);
+        expect(extra.token).toBe(first.token);
+      }
+      expect(service.list('user-1')).toHaveLength(1);
+      service.resolve(first.token, 'user-1', 'denied');
+      await expect(first.decision).resolves.toBe('denied');
+    });
+
+    it('the waiter count restarts with a new hold for the same id', () => {
+      const first = service.open(input())!;
+      service.open(input());
+      expect(service.open(input())!.dropped).toBe(true);
+      service.resolve(first.token, 'user-1', 'denied');
+      const again = service.open(input())!;
+      expect(again.shared).toBeFalsy();
+      expect(service.open(input())!.dropped).toBeFalsy();
     });
 
     it('the same id on another connection is a different request', () => {
@@ -267,20 +298,21 @@ describe('ApprovalService', () => {
       expect(service.open(input({ requestId: 'fits-now' }))).toBeDefined();
     });
 
-    it('refuses a hold beyond the per-user cap of 50, below the global one; other users are unaffected', () => {
-      // 5 connections x 10 holds = 50 for one user.
-      for (let c = 0; c < 5; c++) {
-        for (let i = 0; i < APPROVAL_CONSTANTS.MAX_HOLDS_PER_CONNECTION; i++) {
-          expect(
-            service.open(input({ connectionId: `conn-${c}`, requestId: `r${c}-${i}` })),
-          ).toBeDefined();
-        }
+    it('refuses a hold beyond the per-user cap of 25, a fraction of the global one; other users are unaffected', () => {
+      const cap = APPROVAL_CONSTANTS.MAX_HOLDS_PER_USER;
+      expect(cap).toBe(25);
+      // Ten holds per connection, so three connections reach it.
+      for (let n = 0; n < cap; n++) {
+        expect(
+          service.open(input({ connectionId: `conn-${Math.floor(n / 10)}`, requestId: `r${n}` })),
+        ).toBeDefined();
       }
       expect(service.open(input({ connectionId: 'conn-9', requestId: 'over' }))).toBeUndefined();
       expect(
         service.open(input({ userId: 'user-2', connectionId: 'conn-x', requestId: 'o' })),
       ).toBeDefined();
-      expect(APPROVAL_CONSTANTS.MAX_HOLDS_GLOBAL).toBeGreaterThan(50);
+      // Four accounts at the cap must not fill every hold there is.
+      expect(cap * 4).toBeLessThanOrEqual(APPROVAL_CONSTANTS.MAX_HOLDS_GLOBAL);
     });
 
     it('refuses a hold beyond the global cap', () => {
@@ -378,10 +410,70 @@ describe('previewSignEvent', () => {
     ]);
   });
 
-  it('cuts every value to 100 characters, and a tag to 3 values', () => {
+  it('cuts every value to 100 characters, and a tag to 3 values, and says it did', () => {
     const preview = previewSignEvent(event({ tags: [['x', 'v'.repeat(500), 'b', 'c', 'd']] }))!;
     expect(preview.tags![0]!.values).toHaveLength(3);
     expect(preview.tags![0]!.values[0]).toHaveLength(100);
+    expect(preview.tags![0]!.cut).toBe(true);
+  });
+
+  it('does not mark a tag that was shown whole', () => {
+    const preview = previewSignEvent(event({ tags: [['p', 'abc', 'def']] }))!;
+    expect(preview.tags![0]).toEqual({ name: 'p', values: ['abc', 'def'] });
+  });
+
+  it('counts the tag values that are not text instead of silently dropping them', () => {
+    const preview = previewSignEvent(
+      event({
+        tags: [
+          ['e', 'abc', 5, { a: 1 }, null, 'def'],
+          ['t', 'plain'],
+        ],
+      }),
+    )!;
+    expect(preview.tags).toEqual([
+      { name: 'e', values: ['abc', 'def'], nonText: 3 },
+      { name: 't', values: ['plain'] },
+    ]);
+  });
+
+  describe("the event's own created_at", () => {
+    const nowS = () => Math.floor(Date.now() / 1000);
+
+    it('is shown as a date, and not flagged when it is about now', () => {
+      const at = nowS() - 30;
+      const preview = previewSignEvent(event({ created_at: at }))!;
+      expect(preview.eventTime).toBe(new Date(at * 1000).toISOString());
+      expect(preview.eventTimeOff).toBe(false);
+    });
+
+    it.each([
+      ['two days ago', () => nowS() - 2 * 86_400],
+      ['two days ahead', () => nowS() + 2 * 86_400],
+    ])('is flagged when it is %s', (_name, at) => {
+      const preview = previewSignEvent(event({ created_at: at() }))!;
+      expect(preview.eventTimeOff).toBe(true);
+      expect(preview.eventTime).toBeDefined();
+    });
+
+    it('is not flagged just inside a day', () => {
+      expect(previewSignEvent(event({ created_at: nowS() - 86_000 }))!.eventTimeOff).toBe(false);
+    });
+
+    it.each(['yesterday', 1.5, 1e300, null])(
+      'is flagged, without a date, when it is not a usable time (%j)',
+      (bad) => {
+        const preview = previewSignEvent(event({ created_at: bad }))!;
+        expect(preview.eventTimeOff).toBe(true);
+        expect(preview.eventTime).toBeUndefined();
+      },
+    );
+
+    it('says nothing when the event has none', () => {
+      const preview = previewSignEvent(event({}))!;
+      expect(preview.eventTime).toBeUndefined();
+      expect(preview.eventTimeOff).toBeUndefined();
+    });
   });
 
   it('cleans tag values like content: controls, bidi and invisible characters never reach the view', () => {
@@ -424,6 +516,22 @@ describe('previewSignEvent', () => {
     const evil = 'a\u00adb\u061cc\u115fd\u1160e\u3164f\uffa0g\ufe0fh\u{E0041}i';
     const preview = previewSignEvent(event({ content: evil }))!;
     expect(preview.content).toBe('a b c d e f g h i');
+  });
+
+  it('removes every other default-ignorable character too, and the interlinear and object marks', () => {
+    // U+034F, U+17B4, U+17B5, U+180B, U+180F, U+206A, U+206F, U+FFF0, U+FFF8, U+FFF9, U+FFFB, U+FFFC
+    const evil =
+      'a\u034fb\u17b4c\u17b5d\u180be\u180ff\u206ag\u206fh\ufff0i\ufff8j\ufff9k\ufffbl\ufffcm';
+    expect(previewSignEvent(event({ content: evil }))!.content).toBe('a b c d e f g h i j k l m');
+  });
+
+  it('shows every blank-looking character as the plain space it looks like', () => {
+    // no-break space, en space, em space, ideographic space, narrow no-break space, braille blank
+    const blanks = 'a\u00a0b\u2002c\u2003d\u3000e\u202ff\u2800g';
+    expect(previewSignEvent(event({ content: blanks }))!.content).toBe('a b c d e f g');
+    expect(previewSignEvent(event({ tags: [['t', blanks]] }))!.tags![0]!.values[0]).toBe(
+      'a b c d e f g',
+    );
   });
 
   it('keeps ordinary non-ASCII text intact', () => {
@@ -472,11 +580,13 @@ describe('previewSignEvent', () => {
       )!;
 
     it('puts the host and path of u, the method and the payload where they cannot be missed', () => {
-      expect(login('https://shop.example/api/account?confirm=1').httpAuth).toEqual({
+      const u = 'https://shop.example/api/account?confirm=1';
+      expect(login(u).httpAuth).toEqual({
         host: 'shop.example',
         path: '/api/account?confirm=1',
         method: 'DELETE',
         payload: PAYLOAD,
+        urlLength: u.length,
       });
     });
 
@@ -494,6 +604,45 @@ describe('previewSignEvent', () => {
       const auth = login('not a url\u202e')!.httpAuth!;
       expect(auth.host).toBeUndefined();
       expect(auth.url).toBe('not a url?');
+    });
+
+    it('shows the END of a long URL: the tail is where `&confirm=delete` hides', () => {
+      const u = `https://victim.example/settings?pad=${'a'.repeat(190)}&confirm=delete`;
+      const auth = login(u).httpAuth!;
+      expect(auth.path).toBe(`/settings?pad=${'a'.repeat(190)}&confirm=delete`);
+      expect(auth.path!.endsWith('&confirm=delete')).toBe(true);
+      expect(auth.truncated).toBeUndefined();
+      expect(auth.urlLength).toBe(u.length);
+    });
+
+    it('shows a URL up to 2048 characters whole', () => {
+      const u = `https://victim.example/${'p'.repeat(2048 - 'https://victim.example/'.length)}`;
+      expect(u.length).toBe(2048);
+      const auth = login(u).httpAuth!;
+      expect(auth.path).toHaveLength(2048 - 'https://victim.example'.length);
+      expect(auth.truncated).toBeUndefined();
+    });
+
+    it('SAYS so when it has to cut: truncated, and how long the URL really was', () => {
+      const u = `https://victim.example/${'p'.repeat(3000)}&confirm=delete`;
+      const auth = login(u).httpAuth!;
+      expect(auth.truncated).toBe(true);
+      expect(auth.urlLength).toBe(u.length);
+      expect(auth.path!.length).toBeLessThan(u.length);
+      expect(auth.path!.endsWith('&confirm=delete')).toBe(false);
+    });
+
+    it('says so when the method or payload is cut too', () => {
+      const auth = previewSignEvent(
+        event({
+          kind: 27235,
+          tags: [
+            ['u', 'https://x.example/'],
+            ['payload', 'f'.repeat(300)],
+          ],
+        }),
+      )!.httpAuth!;
+      expect(auth.truncated).toBe(true);
     });
 
     it('only for kind 27235', () => {
@@ -526,6 +675,7 @@ describe('previewRequest', () => {
       const preview = previewRequest(method, [PEER, 'secret\u202eplan']);
       expect(preview).toEqual({
         peer: PEER,
+        peerNpub: nip19.npubEncode(PEER),
         content: 'secret plan',
         contentTruncated: false,
         contentLength: 11,
@@ -538,18 +688,107 @@ describe('previewRequest', () => {
     (method) => {
       const ciphertext = 'x'.repeat(300) + '?iv=abc';
       const preview = previewRequest(method, [PEER, ciphertext]);
-      expect(preview).toEqual({ peer: PEER, ciphertextLength: ciphertext.length });
+      expect(preview).toEqual({
+        peer: PEER,
+        peerNpub: nip19.npubEncode(PEER),
+        ciphertextLength: ciphertext.length,
+      });
       expect(JSON.stringify(preview)).not.toContain('xxxx');
     },
   );
+
+  it('gives the peer as an npub, for display', () => {
+    expect(previewRequest('nip44_decrypt', [PEER, 'c'])!.peerNpub).toMatch(/^npub1[a-z0-9]{58}$/);
+  });
 
   it('cleans and bounds a peer value that is not a pubkey', () => {
     const preview = previewRequest('nip44_decrypt', ['\u202e' + 'p'.repeat(200), 'c'])!;
     expect(preview.peer).toHaveLength(64);
     expect(preview.peer).not.toContain('\u202e');
+    expect(preview.peerNpub).toBeUndefined();
   });
 
   it.each(['ping', 'connect', 'get_public_key', 'switch_relays'])('has none for %s', (method) => {
     expect(previewRequest(method, [])).toBeUndefined();
+  });
+});
+
+describe('holdBlocker', () => {
+  const PEER = 'ab'.repeat(32);
+  const login = (u: string) =>
+    JSON.stringify({
+      kind: 27235,
+      content: '',
+      tags: [
+        ['u', u],
+        ['method', 'GET'],
+      ],
+    });
+  const URL_MAX = APPROVAL_CONSTANTS.PREVIEW_URL_MAX;
+  const base = 'https://victim.example/';
+
+  it('holds a login whose URL can be shown in full', () => {
+    expect(URL_MAX).toBe(2048);
+    expect(holdBlocker('sign_event', [login(base + 'a'.repeat(URL_MAX - base.length))])).toBe(
+      undefined,
+    );
+  });
+
+  it('refuses to hold a login whose URL is longer than can be shown', () => {
+    const reason = holdBlocker('sign_event', [login(base + 'a'.repeat(URL_MAX - base.length + 1))]);
+    expect(reason).toMatch(/too long/);
+  });
+
+  it('looks at every u tag, not just the first', () => {
+    const event = JSON.stringify({
+      kind: 27235,
+      tags: [
+        ['u', 'https://ok.example/'],
+        ['u', base + 'a'.repeat(URL_MAX)],
+      ],
+    });
+    expect(holdBlocker('sign_event', [event])).toMatch(/too long/);
+  });
+
+  it('counts the URL in characters, not bytes or UTF-16 units', () => {
+    expect(holdBlocker('sign_event', [login(base + '😀'.repeat(URL_MAX - base.length))])).toBe(
+      undefined,
+    );
+  });
+
+  it('does not touch other kinds, or events that are not JSON', () => {
+    const note = JSON.stringify({ kind: 1, tags: [['u', 'x'.repeat(5000)]] });
+    expect(holdBlocker('sign_event', [note])).toBeUndefined();
+    expect(holdBlocker('sign_event', ['not json'])).toBeUndefined();
+    expect(holdBlocker('sign_event', [])).toBeUndefined();
+  });
+
+  describe.each(['nip04_encrypt', 'nip44_encrypt', 'nip04_decrypt', 'nip44_decrypt'])(
+    '%s',
+    (method) => {
+      it('may be held with a public key and a payload', () => {
+        expect(holdBlocker(method, [PEER, 'hello'])).toBeUndefined();
+      });
+
+      it.each([
+        ['no params', []],
+        ['a peer that is not a key', ['somebody', 'hello']],
+        ['a short hex peer', ['ab'.repeat(31), 'hello']],
+        ['no payload', [PEER]],
+        ['an empty payload', [PEER, '']],
+      ])('is not held with %s', (_name, params) => {
+        expect(holdBlocker(method, params as string[])).toBeDefined();
+      });
+
+      it('is not held with a payload beyond the limit, but is at the limit', () => {
+        const max = APPROVAL_CONSTANTS.MAX_HOLD_PAYLOAD_CHARS;
+        expect(holdBlocker(method, [PEER, 'x'.repeat(max)])).toBeUndefined();
+        expect(holdBlocker(method, [PEER, 'x'.repeat(max + 1)])).toMatch(/too big/);
+      });
+    },
+  );
+
+  it.each(['ping', 'connect', 'get_public_key', 'switch_relays'])('has no opinion on %s', (m) => {
+    expect(holdBlocker(m, [])).toBeUndefined();
   });
 });

@@ -6,6 +6,7 @@ import { EventsService } from '../events/events.service.js';
 import { EncryptionService } from '../common/crypto/encryption.service.js';
 import {
   ApprovalService,
+  holdBlocker,
   previewRequest,
   type ApprovalOutcome,
   type HeldRequest,
@@ -356,9 +357,14 @@ export class BunkerRpcHandler {
       // Hold and ask: on an ASK connection the denial becomes a wait for the operator. The caller
       // tells the client to wait and answers when the hold ends. When no hold can be opened (too many
       // are open, or the id is in use for another request), when there is no link to send the client
-      // (no PUBLIC_BASE_URL), or when the caller says this request is too old to hold, the request is
-      // simply denied, with the same text as ever.
-      if (connection.approvalMode === 'ASK' && holdAllowed && this.approvals.canAsk) {
+      // (no PUBLIC_BASE_URL), when the caller says this request is too old to hold, or when it could
+      // not be judged or answered anyway (see holdBlocker), the request is simply denied, with the
+      // same text as ever. The pending row above is filed either way.
+      const blocked = holdBlocker(request.method, request.params);
+      if (blocked) {
+        this.logger.warn(`Not holding ${request.method} for ${connection.name}: ${blocked}`);
+      }
+      if (connection.approvalMode === 'ASK' && holdAllowed && this.approvals.canAsk && !blocked) {
         const hold = this.approvals.open({
           userId: connection.userId,
           connectionId: connection.id,

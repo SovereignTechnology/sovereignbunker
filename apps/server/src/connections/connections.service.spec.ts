@@ -368,6 +368,52 @@ describe('ConnectionsService', () => {
         ],
       });
     });
+
+    it('replaces the grants in ONE transaction: all of it or none, never the old grants gone and no new ones', async () => {
+      const tx = {
+        connectionPermission: {
+          deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+          createMany: vi.fn().mockResolvedValue({ count: 1 }),
+        },
+      };
+      const run = vi.mocked(
+        (prisma as unknown as { $transaction: (fn: (t: unknown) => unknown) => unknown })
+          .$transaction,
+      );
+      run.mockImplementationOnce(async (fn) => fn(tx));
+
+      await service.setPermissions('conn-1', [{ method: 'sign_event', kind: 1 }]);
+
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(tx.connectionPermission.deleteMany).toHaveBeenCalledTimes(2);
+      expect(tx.connectionPermission.createMany).toHaveBeenCalledTimes(1);
+      // Nothing went around the transaction.
+      expect(prisma.connectionPermission?.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+
+    it('a permission listed twice is stored once: a repeat must not break the unique index and wipe the grants', async () => {
+      await service.setPermissions('conn-1', [
+        { method: 'sign_event', kind: 1 },
+        { method: 'sign_event', kind: 1 },
+        { method: 'nip44_decrypt' },
+        { method: 'nip44_decrypt' },
+      ]);
+      expect(prisma.connectionPermission?.createMany).toHaveBeenCalledWith({
+        data: [
+          { connectionId: 'conn-1', method: 'sign_event', kind: 1, allowed: true },
+          { connectionId: 'conn-1', method: 'nip44_decrypt', kind: null, allowed: true },
+        ],
+      });
+    });
+
+    it('an empty list revokes every grant and inserts nothing', async () => {
+      await service.setPermissions('conn-1', []);
+      expect(prisma.connectionPermission?.deleteMany).toHaveBeenCalledWith({
+        where: { connectionId: 'conn-1', allowed: true },
+      });
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
   });
 
   describe('requestPermissions', () => {
@@ -564,33 +610,77 @@ describe('ConnectionsService', () => {
   });
 
   describe('approveRequests', () => {
+    const owner = () =>
+      vi
+        .mocked(prisma.bunkerConnection!.findUnique!)
+        .mockResolvedValue({ id: 'conn-1', userId: 'user-1' } as never);
+
     it('throws when the connection does not belong to the user', async () => {
       vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
         id: 'conn-1',
         userId: 'other',
       } as never);
-      await expect(service.approveRequests('conn-1', 'user-1')).rejects.toThrow(NotFoundException);
+      await expect(
+        service.approveRequests('conn-1', 'user-1', [{ method: 'sign_event', kind: 1 }]),
+      ).rejects.toThrow(NotFoundException);
       expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
     });
 
-    it('approves all pending requests by flipping allowed to true', async () => {
-      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
-        id: 'conn-1',
-        userId: 'user-1',
-      } as never);
-      await service.approveRequests('conn-1', 'user-1');
+    it('approves exactly the given requests by flipping allowed to true', async () => {
+      owner();
+      await service.approveRequests('conn-1', 'user-1', [{ method: 'sign_event', kind: 7 }]);
       expect(prisma.connectionPermission?.updateMany).toHaveBeenCalledWith({
-        where: { connectionId: 'conn-1', allowed: false },
+        where: {
+          connectionId: 'conn-1',
+          allowed: false,
+          OR: [{ method: 'sign_event', kind: 7 }],
+        },
         data: { allowed: true },
       });
     });
 
-    it('approves only the given subset when provided', async () => {
-      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
-        id: 'conn-1',
-        userId: 'user-1',
-      } as never);
-      await service.approveRequests('conn-1', 'user-1', [{ method: 'nip44_decrypt' }]);
+    it('an EMPTY list approves nothing: it is never "all"', async () => {
+      owner();
+      await service.approveRequests('conn-1', 'user-1', []);
+      expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a login', { method: 'sign_event', kind: 27235 }],
+      ['a profile', { method: 'sign_event', kind: 0 }],
+      ['a seal', { method: 'sign_event', kind: 13 }],
+      ['wallet connect', { method: 'sign_event', kind: 23194 }],
+      ['every kind', { method: 'sign_event' }],
+      ['a decrypt', { method: 'nip44_decrypt' }],
+      ['an encrypt', { method: 'nip04_encrypt' }],
+    ] as const)(
+      'approving %s without a confirmation is a 409 and changes nothing',
+      async (_n, perm) => {
+        owner();
+        await expect(service.approveRequests('conn-1', 'user-1', [perm])).rejects.toThrow(
+          ConflictException,
+        );
+        await expect(service.approveRequests('conn-1', 'user-1', [perm], false)).rejects.toThrow(
+          ConflictException,
+        );
+        expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('one wide request in a list holds the whole list back', async () => {
+      owner();
+      await expect(
+        service.approveRequests('conn-1', 'user-1', [
+          { method: 'sign_event', kind: 1 },
+          { method: 'sign_event', kind: 27235 },
+        ]),
+      ).rejects.toThrow(/sign_event:27235/);
+      expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('approves a wide request once it is confirmed', async () => {
+      owner();
+      await service.approveRequests('conn-1', 'user-1', [{ method: 'nip44_decrypt' }], true);
       expect(prisma.connectionPermission?.updateMany).toHaveBeenCalledWith({
         where: {
           connectionId: 'conn-1',
@@ -599,6 +689,72 @@ describe('ConnectionsService', () => {
         },
         data: { allowed: true },
       });
+    });
+
+    it.each([1, 6, 7, 16])('approves the ordinary kind %i without a confirmation', async (kind) => {
+      owner();
+      await service.approveRequests('conn-1', 'user-1', [{ method: 'sign_event', kind }]);
+      expect(prisma.connectionPermission?.updateMany).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('approveAllRequests ("Approve all")', () => {
+    const owner = () =>
+      vi
+        .mocked(prisma.bunkerConnection!.findUnique!)
+        .mockResolvedValue({ id: 'conn-1', userId: 'user-1' } as never);
+
+    it('throws when the connection does not belong to the user', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'other',
+      } as never);
+      await expect(service.approveAllRequests('conn-1', 'user-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('approves the ordinary kinds and LEAVES the wide ones pending, counting them', async () => {
+      owner();
+      // What a hostile client could have filed: a login, a decrypt, a seal, and a few ordinary kinds.
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { id: 'p1', method: 'sign_event', kind: 1 },
+        { id: 'p2', method: 'sign_event', kind: 27235 },
+        { id: 'p3', method: 'nip44_decrypt', kind: null },
+        { id: 'p4', method: 'sign_event', kind: 7 },
+        { id: 'p5', method: 'sign_event', kind: 13 },
+        { id: 'p6', method: 'sign_event', kind: null },
+      ] as never);
+
+      const result = await service.approveAllRequests('conn-1', 'user-1');
+
+      expect(result).toEqual({ approved: 2, needConfirmation: 4 });
+      expect(prisma.connectionPermission?.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.connectionPermission?.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['p1', 'p4'] }, connectionId: 'conn-1', allowed: false },
+        data: { allowed: true },
+      });
+    });
+
+    it("reads only this connection's pending rows", async () => {
+      owner();
+      await service.approveAllRequests('conn-1', 'user-1');
+      expect(prisma.connectionPermission?.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { connectionId: 'conn-1', allowed: false } }),
+      );
+    });
+
+    it('with only wide requests pending, approves nothing', async () => {
+      owner();
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { id: 'p1', method: 'sign_event', kind: 27235 },
+      ] as never);
+      expect(await service.approveAllRequests('conn-1', 'user-1')).toEqual({
+        approved: 0,
+        needConfirmation: 1,
+      });
+      expect(prisma.connectionPermission?.updateMany).not.toHaveBeenCalled();
     });
   });
 

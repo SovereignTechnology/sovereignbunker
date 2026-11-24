@@ -668,6 +668,13 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     const reply = await this.runRpc(clientPubkey, signerPubkeyHex, parsed.data, undefined, mayHold);
 
     if (reply.hold) {
+      if (reply.hold.shared) {
+        // Another event already waits on this request id and answers it, once. This one adds no
+        // second answer, no second signature and no second audit row: it is acknowledged and done.
+        // An event past the retry the hold allows is not even remembered, so a flood of them cannot
+        // push real ids out of the replay guard.
+        return !reply.hold.dropped;
+      }
       await this.answerHeldRequest(
         reply.hold,
         parsed.data,
@@ -737,9 +744,10 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     signerSecretKey: Uint8Array,
     relays: string[],
   ) {
-    // A retry of a request that is already held (same id) shares that hold and sends nothing here:
-    // its client has had its one interim, and a second would count as a refusal.
-    const url = hold.shared ? undefined : this.approvals.authUrl(hold.token);
+    // Only the event that opened the hold gets here (a retry shares it and is acknowledged by the
+    // caller), so the client is sent its one interim reply and one final answer, whatever else
+    // arrives under the same request id.
+    const url = this.approvals.authUrl(hold.token);
     if (url) {
       await this.sendResponse(
         { id: request.id, result: 'auth_url', error: url },

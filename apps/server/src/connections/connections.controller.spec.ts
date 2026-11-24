@@ -27,6 +27,9 @@ describe('ConnectionsController', () => {
       setPermissions: vi.fn().mockResolvedValue(undefined),
       updateConnectionStatus: vi.fn().mockResolvedValue({ id: 'conn-1', status: 'REVOKED' }),
       setApprovalMode: vi.fn().mockResolvedValue({ id: 'conn-1', approvalMode: 'ASK' }),
+      approveRequests: vi.fn().mockResolvedValue(undefined),
+      approveAllRequests: vi.fn().mockResolvedValue({ approved: 2, needConfirmation: 1 }),
+      denyRequests: vi.fn().mockResolvedValue(undefined),
       deleteConnection: vi.fn().mockResolvedValue(undefined),
     };
     bunker = {
@@ -122,6 +125,92 @@ describe('ConnectionsController', () => {
     ])('refuses %s with 400 and stores nothing', async (_name, permissions) => {
       await expect(put(permissions)).rejects.toThrow(BadRequestException);
       expect(service['setPermissions']).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('approving and denying pending requests', () => {
+    const approve = (body: unknown) => controller.approvePermissionRequests(req, 'conn-1', body);
+    const deny = (body: unknown) => controller.denyPermissionRequests(req, 'conn-1', body);
+
+    it('approves exactly the given list, unconfirmed unless the caller says so', async () => {
+      const permissions = [{ method: 'sign_event', kind: 1 }];
+      await approve({ permissions });
+      expect(service['approveRequests']).toHaveBeenCalledWith(
+        'conn-1',
+        'user-1',
+        permissions,
+        false,
+      );
+    });
+
+    it('passes confirm: true through, and only a real true', async () => {
+      const permissions = [{ method: 'nip44_decrypt' }];
+      await approve({ permissions, confirm: true });
+      expect(service['approveRequests']).toHaveBeenLastCalledWith(
+        'conn-1',
+        'user-1',
+        permissions,
+        true,
+      );
+      await expect(approve({ permissions, confirm: 'true' })).rejects.toThrow(BadRequestException);
+      await expect(approve({ permissions, confirm: 1 })).rejects.toThrow(BadRequestException);
+    });
+
+    it.each([
+      ['no body', undefined],
+      ['an empty body: it must NOT mean "approve all"', {}],
+      ['an empty list: it must NOT mean "approve all"', { permissions: [] }],
+      ['a kind beyond 65535', { permissions: [{ method: 'sign_event', kind: 3_000_000_000 }] }],
+      ['a fractional kind', { permissions: [{ method: 'sign_event', kind: 1.5 }] }],
+      ['a filter object as a kind', { permissions: [{ method: 'sign_event', kind: { gte: 0 } }] }],
+      ['an unknown method', { permissions: [{ method: 'delete_everything' }] }],
+      ['a list that is not a list', { permissions: 'sign_event:1' }],
+      ['an extra field', { permissions: [{ method: 'sign_event', kind: 1 }], all: true }],
+    ])('approve refuses %s with 400 and approves nothing', async (_name, body) => {
+      await expect(approve(body)).rejects.toThrow(BadRequestException);
+      expect(service['approveRequests']).not.toHaveBeenCalled();
+      expect(service['approveAllRequests']).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['no body', undefined],
+      ['an empty body: it must NOT mean "deny all"', {}],
+      ['an empty list', { permissions: [] }],
+      ['a kind beyond 65535', { permissions: [{ method: 'sign_event', kind: 3_000_000_000 }] }],
+      ['a filter object as a kind', { permissions: [{ method: 'sign_event', kind: { gte: 0 } }] }],
+    ])('deny refuses %s with 400 and denies nothing', async (_name, body) => {
+      await expect(deny(body)).rejects.toThrow(BadRequestException);
+      expect(service['denyRequests']).not.toHaveBeenCalled();
+    });
+
+    it('denies exactly the given list', async () => {
+      const permissions = [{ method: 'sign_event', kind: 27235 }];
+      await deny({ permissions });
+      expect(service['denyRequests']).toHaveBeenCalledWith('conn-1', 'user-1', permissions);
+    });
+
+    it('"approve all" is its own call: ordinary kinds only, and it says how many it left', async () => {
+      await expect(controller.approveAllPermissionRequests(req, 'conn-1')).resolves.toEqual({
+        success: true,
+        approved: 2,
+        needConfirmation: 1,
+      });
+      expect(service['approveAllRequests']).toHaveBeenCalledWith('conn-1', 'user-1');
+      expect(service['approveRequests']).not.toHaveBeenCalled();
+    });
+
+    it('"deny all" is its own call too', async () => {
+      await controller.denyAllPermissionRequests(req, 'conn-1');
+      expect(service['denyRequests']).toHaveBeenCalledWith('conn-1', 'user-1');
+    });
+
+    it('the routes are POST :id/permissions/approve, approve-all, deny and deny-all', () => {
+      const route = (name: keyof ConnectionsController) =>
+        Reflect.getMetadata('path', ConnectionsController.prototype[name]) as string;
+      expect(route('approvePermissionRequests')).toBe(':id/permissions/approve');
+      expect(route('approveAllPermissionRequests')).toBe(':id/permissions/approve-all');
+      expect(route('denyPermissionRequests')).toBe(':id/permissions/deny');
+      expect(route('denyAllPermissionRequests')).toBe(':id/permissions/deny-all');
     });
   });
 

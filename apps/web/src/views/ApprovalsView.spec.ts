@@ -127,6 +127,160 @@ describe('ApprovalsView', () => {
     expect(auth).toContain(payload);
   });
 
+  describe('a login URL that is not shown in full', () => {
+    const longLogin = (truncated?: boolean) =>
+      item({
+        preview: {
+          kind: 27235,
+          content: '',
+          tags: [{ name: 'u', values: ['https://victim.example/settings?pad=aaaa'] }],
+          httpAuth: {
+            host: 'victim.example',
+            path: '/settings?pad=aaaa',
+            method: 'GET',
+            truncated,
+            urlLength: 3500,
+          },
+        },
+      });
+
+    it('says so in red, with how long the URL really is', async () => {
+      const w = mountView([longLogin(true)]);
+      await flushPromises();
+      const note = w.get('[data-testid="approval-url-truncated"]');
+      expect(note.text()).toContain('longer than shown');
+      expect(note.text()).toContain('3500');
+      expect(note.classes().join(' ')).toContain('text-destructive');
+    });
+
+    it('says nothing when the URL is shown whole', async () => {
+      const w = mountView([longLogin(undefined)]);
+      await flushPromises();
+      expect(w.find('[data-testid="approval-url-truncated"]').exists()).toBe(false);
+    });
+
+    it('Allow once is a SECOND click, after a warning that part of the URL is not shown', async () => {
+      const w = mountView([longLogin(true)]);
+      await flushPromises();
+      await w.get('[data-testid="approve-once"]').trigger('click');
+      expect(apiPost).not.toHaveBeenCalled();
+      expect(w.get('[data-testid="approval-once-warning"]').text()).toContain('longer than');
+      expect(w.get('[data-testid="approve-once"]').text()).toBe('Yes, allow once');
+
+      apiGet.mockResolvedValue({ approvals: [] });
+      await w.get('[data-testid="approve-once"]').trigger('click');
+      await flushPromises();
+      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', { mode: 'once' });
+    });
+
+    it('a login shown whole is allowed once with one click, as before', async () => {
+      const w = mountView([longLogin(undefined)]);
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [] });
+      await w.get('[data-testid="approve-once"]').trigger('click');
+      await flushPromises();
+      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', { mode: 'once' });
+      expect(w.find('[data-testid="approval-once-warning"]').exists()).toBe(false);
+    });
+
+    it('Deny is always one click', async () => {
+      const w = mountView([longLogin(true)]);
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [] });
+      await w.get('[data-testid="deny"]').trigger('click');
+      await flushPromises();
+      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/deny');
+    });
+  });
+
+  describe('the date the event carries', () => {
+    it('is shown, and not flagged, when it is about now', async () => {
+      const w = mountView([
+        item({
+          kind: 1,
+          preview: {
+            kind: 1,
+            content: 'hi',
+            eventTime: '2026-11-24T11:59:00.000Z',
+            eventTimeOff: false,
+          },
+        }),
+      ]);
+      await flushPromises();
+      const line = w.get('[data-testid="approval-event-time"]');
+      expect(line.text()).toContain('2026-11-24T11:59:00.000Z');
+      expect(line.text()).not.toContain('more than a day');
+    });
+
+    it('is flagged when it is a day or more from now: a stale or future-dated event', async () => {
+      const w = mountView([
+        item({
+          kind: 1,
+          preview: {
+            kind: 1,
+            content: 'hi',
+            eventTime: '2026-11-20T00:00:00.000Z',
+            eventTimeOff: true,
+          },
+        }),
+      ]);
+      await flushPromises();
+      const line = w.get('[data-testid="approval-event-time"]');
+      expect(line.text()).toContain('2026-11-20T00:00:00.000Z');
+      expect(line.text()).toContain('more than a day from now');
+      expect(line.classes().join(' ')).toContain('font-semibold');
+    });
+
+    it('says when the date is not a time at all', async () => {
+      const w = mountView([
+        item({ kind: 1, preview: { kind: 1, content: 'hi', eventTimeOff: true } }),
+      ]);
+      await flushPromises();
+      expect(w.get('[data-testid="approval-event-time"]').text()).toContain('not a valid time');
+    });
+
+    it('is left out when the event has none', async () => {
+      const w = mountView([item({ kind: 1, preview: { kind: 1, content: 'hi' } })]);
+      await flushPromises();
+      expect(w.find('[data-testid="approval-event-time"]').exists()).toBe(false);
+    });
+  });
+
+  describe('tags that are not shown whole', () => {
+    it('counts the values that are not text', async () => {
+      const w = mountView([
+        item({
+          kind: 1,
+          preview: { kind: 1, tags: [{ name: 'e', values: ['abc'], nonText: 3 }] },
+        }),
+      ]);
+      await flushPromises();
+      expect(w.get('[data-testid="approval-tags"]').text()).toContain('(+3 non-text tag values)');
+    });
+
+    it('marks a value that was cut', async () => {
+      const w = mountView([
+        item({
+          kind: 1,
+          preview: { kind: 1, tags: [{ name: 't', values: ['x'.repeat(100)], cut: true }] },
+        }),
+      ]);
+      await flushPromises();
+      const mark = w.get('[data-testid="approval-tags"] [title="Not shown in full"]');
+      expect(mark.text()).toBe('…');
+    });
+
+    it('adds no marker to a tag that is whole', async () => {
+      const w = mountView([
+        item({ kind: 1, preview: { kind: 1, tags: [{ name: 'p', values: ['abc'] }] } }),
+      ]);
+      await flushPromises();
+      const tags = w.get('[data-testid="approval-tags"]');
+      expect(tags.text()).not.toContain('non-text');
+      expect(tags.find('[title="Not shown in full"]').exists()).toBe(false);
+    });
+  });
+
   it('says how long the whole content is when only part of it is shown', async () => {
     const w = mountView([
       item({
@@ -138,19 +292,50 @@ describe('ApprovalsView', () => {
     expect(w.get('[data-testid="approval-preview"]').text()).toContain('5421');
   });
 
-  it('for a decrypt shows who it is with and how big the ciphertext is', async () => {
+  describe('who an encrypt or a decrypt is with', () => {
     const peer = 'ab12cd34' + 'e'.repeat(48) + '56ef78ab';
-    const w = mountView([
-      item({
-        method: 'nip44_decrypt',
-        kind: undefined,
-        preview: { peer, ciphertextLength: 312 },
-      }),
-    ]);
-    await flushPromises();
-    const text = w.get('[data-testid="approval-preview"]').text();
-    expect(text).toContain('ab12cd34…56ef78ab');
-    expect(text).toContain('312');
+    const npub = 'npub1' + 'q'.repeat(10) + 'wxyz0123456789' + 'a'.repeat(34);
+
+    it('shows the npub: the first 12 and the last 12 characters, the whole one on hover', async () => {
+      const w = mountView([
+        item({
+          method: 'nip44_decrypt',
+          kind: undefined,
+          preview: { peer, peerNpub: npub, ciphertextLength: 312 },
+        }),
+      ]);
+      await flushPromises();
+      const shown = w.get('[data-testid="approval-peer"] span');
+      expect(shown.text()).toBe(`${npub.slice(0, 12)}…${npub.slice(-12)}`);
+      expect(shown.attributes('title')).toBe(npub);
+      expect(w.get('[data-testid="approval-ciphertext"]').text()).toContain('312');
+    });
+
+    it('shows the first and last 12 of the key as sent when there is no npub', async () => {
+      const w = mountView([
+        item({
+          method: 'nip44_decrypt',
+          kind: undefined,
+          preview: { peer, ciphertextLength: 312 },
+        }),
+      ]);
+      await flushPromises();
+      expect(w.get('[data-testid="approval-peer"]').text()).toContain(
+        `${peer.slice(0, 12)}…${peer.slice(-12)}`,
+      );
+    });
+
+    it('does not shorten a short value into something that hides nothing', async () => {
+      const w = mountView([
+        item({
+          method: 'nip44_decrypt',
+          kind: undefined,
+          preview: { peer: 'abc', ciphertextLength: 1 },
+        }),
+      ]);
+      await flushPromises();
+      expect(w.get('[data-testid="approval-peer"]').text()).toContain('abc');
+    });
   });
 
   it('for an encrypt shows who it is with and what would be encrypted', async () => {
@@ -258,13 +443,109 @@ describe('ApprovalsView', () => {
       expect(cards[0]!.text()).toContain('Second');
     });
 
-    it('a request the operator answered is not kept: it is answered, not gone', async () => {
+    it('a request the operator answered is answered, not gone: no card, a line saying so', async () => {
       const w = mountView([item()]);
       await flushPromises();
       apiGet.mockResolvedValue({ approvals: [] });
       await w.get('[data-testid="approve-once"]').trigger('click');
       await flushPromises();
       expect(w.findAll('[data-testid="approval-card"]')).toHaveLength(0);
+      expect(w.get('[data-testid="approval-tombstone"]').text()).toContain('Allowed once');
+      expect(w.find('[data-testid="approval-gone"]').exists()).toBe(false);
+    });
+  });
+
+  describe('a request the operator answered stays as a line of the same height', () => {
+    const real = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+    beforeEach(() => {
+      // jsdom has no layout: give every card the height a real one would have.
+      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+        configurable: true,
+        get: () => 187,
+      });
+    });
+    afterEach(() => {
+      if (real) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', real);
+    });
+
+    const two = () => {
+      const first = item({ token: 'a', connectionName: 'First' });
+      const second = item({ token: 'b', connectionName: 'Second' });
+      return { first, second, w: mountView([first, second]) };
+    };
+
+    it('the card is replaced by a line as tall as it was, in the same place', async () => {
+      const { second, w } = two();
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [second] });
+      await w.findAll('[data-testid="approve-once"]')[0]!.trigger('click');
+      await flushPromises();
+
+      const rows = w.findAll('[data-testid="approval-tombstone"], [data-testid="approval-card"]');
+      expect(rows.map((r) => r.attributes('data-testid'))).toEqual([
+        'approval-tombstone',
+        'approval-card',
+      ]);
+      expect(rows[0]!.attributes('style')).toContain('min-height: 187px');
+      expect(rows[0]!.text()).toContain('Allowed once');
+      expect(rows[1]!.text()).toContain('Second');
+    });
+
+    it('the line has nothing to approve: a second click where the button was answers nothing', async () => {
+      const { second, w } = two();
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [second] });
+      await w.findAll('[data-testid="approve-once"]')[0]!.trigger('click');
+      await flushPromises();
+      expect(apiPost).toHaveBeenCalledTimes(1);
+
+      const tombstone = w.get('[data-testid="approval-tombstone"]');
+      expect(tombstone.find('[data-testid="approve-once"]').exists()).toBe(false);
+      expect(tombstone.find('[data-testid="approve-always"]').exists()).toBe(false);
+      expect(tombstone.find('[data-testid="deny"]').exists()).toBe(false);
+      // The only Allow once left on the page belongs to the second request.
+      expect(w.findAll('[data-testid="approve-once"]')).toHaveLength(1);
+      expect(apiPost).toHaveBeenCalledTimes(1);
+    });
+
+    it('stays through later refreshes, until it is dismissed', async () => {
+      const { second, w } = two();
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [second] });
+      await w.findAll('[data-testid="approve-once"]')[0]!.trigger('click');
+      await flushPromises();
+
+      $approvals.set([second]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(w.findAll('[data-testid="approval-tombstone"]')).toHaveLength(1);
+
+      await w.get('[data-testid="approval-tombstone-dismiss"]').trigger('click');
+      expect(w.findAll('[data-testid="approval-tombstone"]')).toHaveLength(0);
+      const cards = w.findAll('[data-testid="approval-card"]');
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.text()).toContain('Second');
+    });
+
+    it('a denial leaves the same line, saying Denied', async () => {
+      const { second, w } = two();
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [second] });
+      await w.findAll('[data-testid="deny"]')[0]!.trigger('click');
+      await flushPromises();
+      expect(w.get('[data-testid="approval-tombstone"]').text()).toContain('Denied');
+    });
+
+    it('a dismissed answer does not come back with the next refresh', async () => {
+      const { second, w } = two();
+      await flushPromises();
+      apiGet.mockResolvedValue({ approvals: [second] });
+      await w.findAll('[data-testid="approve-once"]')[0]!.trigger('click');
+      await flushPromises();
+      await w.get('[data-testid="approval-tombstone-dismiss"]').trigger('click');
+      $approvals.set([second]);
+      await flushPromises();
+      expect(w.findAll('[data-testid="approval-tombstone"]')).toHaveLength(0);
+      expect(w.findAll('[data-testid="approval-card"]')).toHaveLength(1);
     });
   });
 
@@ -315,20 +596,35 @@ describe('ApprovalsView', () => {
       apiGet.mockResolvedValue({ approvals: [] });
       await w.get('[data-testid="approve-always"]').trigger('click');
       await flushPromises();
-      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', { mode: 'always' });
+      // The second click is sent as the confirmation the server checks.
+      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', {
+        mode: 'always',
+        confirm: true,
+      });
     });
 
+    // The rule is the shared one, inverted: everything but an ordinary kind is a wide grant.
     it.each([
       ['nip04_encrypt', undefined],
       ['nip04_decrypt', undefined],
       ['nip44_encrypt', undefined],
       ['nip44_decrypt', undefined],
+      ['sign_event', undefined],
+      ['sign_event', 0],
+      ['sign_event', 3],
+      ['sign_event', 4],
       ['sign_event', 5],
+      ['sign_event', 13],
+      ['sign_event', 9734],
+      ['sign_event', 10002],
       ['sign_event', 22242],
+      ['sign_event', 23194],
       ['sign_event', 24133],
+      ['sign_event', 24242],
       ['sign_event', 27235],
+      ['sign_event', 30023],
     ])(
-      'Always allow on %s %s needs a second click: it is a blanket grant',
+      'Always allow on %s %s needs a second click and is sent confirmed: it is a wide grant',
       async (method, kind) => {
         const w = mountView([item({ method, kind, preview: undefined })]);
         await flushPromises();
@@ -339,19 +635,35 @@ describe('ApprovalsView', () => {
         apiGet.mockResolvedValue({ approvals: [] });
         await w.get('[data-testid="approve-always"]').trigger('click');
         await flushPromises();
-        expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', { mode: 'always' });
+        expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', {
+          mode: 'always',
+          confirm: true,
+        });
       },
     );
 
-    it('Always allow on something else is one click', async () => {
-      const w = mountView([
-        item({ kind: 1, preview: { kind: 1, content: 'hi' }, token: 'tok-note' }),
-      ]);
+    it.each([1, 6, 7, 16])(
+      'Always allow on the ordinary kind %i is one click, sent without a confirmation',
+      async (kind) => {
+        const w = mountView([item({ kind, preview: { kind, content: 'hi' }, token: 'tok-note' })]);
+        await flushPromises();
+        apiGet.mockResolvedValue({ approvals: [] });
+        await w.get('[data-testid="approve-always"]').trigger('click');
+        await flushPromises();
+        expect(apiPost).toHaveBeenCalledTimes(1);
+        const [, body] = apiPost.mock.calls[0] as [string, Record<string, unknown>];
+        expect(body).toEqual({ mode: 'always' });
+        expect(body).not.toHaveProperty('confirm');
+      },
+    );
+
+    it('Allow once never carries a confirmation: it grants nothing', async () => {
+      const w = mountView([item({ kind: 4, preview: undefined })]);
       await flushPromises();
       apiGet.mockResolvedValue({ approvals: [] });
-      await w.get('[data-testid="approve-always"]').trigger('click');
+      await w.get('[data-testid="approve-once"]').trigger('click');
       await flushPromises();
-      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-note/approve', { mode: 'always' });
+      expect(apiPost).toHaveBeenCalledWith('/approvals/tok-login/approve', { mode: 'once' });
     });
 
     it('shows the server error and keeps the request when the decision fails', async () => {

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { ConflictException } from '@nestjs/common';
 import { WebSocketServer, type WebSocket as ServerSocket } from 'ws';
 import { generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
 import { BunkerSigner } from 'nostr-tools/nip46';
@@ -305,7 +306,14 @@ describe('hold and ask: a real NIP-46 client against the real signer, over a rel
     const t = await boot({ approvalMode: 'ASK' });
     const first = t.login();
     await until(() => t.approvals.list(USER).length === 1, 'the hold');
-    await t.controller.approve(t.asOwner, t.oneHold().token, { mode: 'always' });
+    // A login is a wide grant: called directly, without the confirmation, the server refuses it and
+    // the client is still waiting.
+    await expect(
+      t.controller.approve(t.asOwner, t.oneHold().token, { mode: 'always' }),
+    ).rejects.toThrow(ConflictException);
+    expect(t.connections.grantPermissions).not.toHaveBeenCalled();
+    expect(t.approvals.size).toBe(1);
+    await t.controller.approve(t.asOwner, t.oneHold().token, { mode: 'always', confirm: true });
     expect(verifyEvent(await first)).toBe(true);
 
     expect(t.connections.grantPermissions).toHaveBeenCalledWith(t.conn.id, USER, [

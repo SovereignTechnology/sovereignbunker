@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { nip19 } from 'nostr-tools';
 import { BunkerRpcHandler } from './bunker-rpc.handler.js';
 import type { ConnectionsService } from '../connections/connections.service.js';
 import type { LoggingService } from '../logging/logging.service.js';
@@ -25,6 +26,8 @@ describe('BunkerRpcHandler', () => {
   const getPublicKeyFromNsec = vi.fn().mockReturnValue('signer-pubkey-hex');
 
   const CLIENT = 'client-pubkey-hex';
+  /** A real public key: an encrypt or decrypt is only held for one. */
+  const PEER = 'ab'.repeat(32);
   const SIGNER = 'signer-pubkey-hex';
 
   function makeConnection(
@@ -526,7 +529,7 @@ describe('BunkerRpcHandler', () => {
             { name: 'u', values: ['https://app.example/login'] },
             { name: 'method', values: ['POST'] },
           ],
-          httpAuth: { host: 'app.example', path: '/login', method: 'POST' },
+          httpAuth: { host: 'app.example', path: '/login', method: 'POST', urlLength: 25 },
         },
       });
       // Nothing is signed, and nothing is logged until the request is answered.
@@ -546,12 +549,12 @@ describe('BunkerRpcHandler', () => {
     it('holds a refused decrypt as a method-level request, showing the peer and the ciphertext length', async () => {
       asking();
       approvals.open.mockReturnValue(aHold());
-      const res = await handle(request('nip44_decrypt', ['third-party-pubkey', 'ciphertext']));
+      const res = await handle(request('nip44_decrypt', [PEER, 'ciphertext']));
       expect(res.hold).toBeDefined();
       expect(approvals.open).toHaveBeenCalledWith(
         expect.objectContaining({
           permission: { method: 'nip44_decrypt' },
-          preview: { peer: 'third-party-pubkey', ciphertextLength: 10 },
+          preview: { peer: PEER, peerNpub: nip19.npubEncode(PEER), ciphertextLength: 10 },
         }),
       );
     });
@@ -559,18 +562,67 @@ describe('BunkerRpcHandler', () => {
     it('holds a refused encrypt, showing the peer and what would be encrypted', async () => {
       asking();
       approvals.open.mockReturnValue(aHold());
-      await handle(request('nip04_encrypt', ['third-party-pubkey', 'meet at noon']));
+      await handle(request('nip04_encrypt', [PEER, 'meet at noon']));
       expect(approvals.open).toHaveBeenCalledWith(
         expect.objectContaining({
           permission: { method: 'nip04_encrypt' },
           preview: {
-            peer: 'third-party-pubkey',
+            peer: PEER,
+            peerNpub: nip19.npubEncode(PEER),
             content: 'meet at noon',
             contentTruncated: false,
             contentLength: 12,
           },
         }),
       );
+    });
+
+    describe('a request that could not be judged or answered is not held', () => {
+      const SHOWN_MAX = 2048;
+      const loginTo = (u: string) =>
+        JSON.stringify({
+          kind: LOGIN_KIND,
+          content: '',
+          tags: [
+            ['u', u],
+            ['method', 'GET'],
+          ],
+        });
+
+      it.each([
+        ['nip44_decrypt', 'a peer that is not a public key', ['third-party-pubkey', 'ciphertext']],
+        ['nip04_decrypt', 'no payload', [PEER]],
+        ['nip44_encrypt', 'an empty payload', [PEER, '']],
+        ['nip04_encrypt', 'a huge payload', [PEER, 'x'.repeat(200_000)]],
+        ['nip44_decrypt', 'no params at all', []],
+      ])('%s with %s is refused at once, the ordinary way', async (method, _why, params) => {
+        asking();
+        const res = await handle(request(method, params));
+        expect(res.hold).toBeUndefined();
+        expect(res.error).toBe(`Permission denied for ${method}`);
+        expect(approvals.open).not.toHaveBeenCalled();
+        // The refusal is logged and filed like any other.
+        expect(connections.requestPermissions).toHaveBeenCalledWith('conn-1', [{ method }]);
+        expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+          expect.objectContaining({ result: 'DENIED' }),
+        );
+      });
+
+      it('a login whose URL is longer than can be shown is refused at once', async () => {
+        asking();
+        const u = `https://shop.example/${'a'.repeat(SHOWN_MAX)}&confirm=delete`;
+        const res = await handle(request('sign_event', [loginTo(u)]));
+        expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+        expect(approvals.open).not.toHaveBeenCalled();
+      });
+
+      it('a login whose URL is shown in full is held', async () => {
+        asking();
+        approvals.open.mockReturnValue(aHold());
+        const u = `https://shop.example/${'a'.repeat(SHOWN_MAX - 30)}`;
+        const res = await handle(request('sign_event', [loginTo(u)]));
+        expect(res.hold).toBeDefined();
+      });
     });
 
     it('asks the same thing twice under one id with the same fingerprint, and another thing under a different one', async () => {

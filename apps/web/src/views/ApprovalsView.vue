@@ -3,7 +3,12 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute } from 'vue-router';
 import { useStore } from '@nanostores/vue';
 import { BellRing, ShieldCheck } from '@lucide/vue';
-import { LOGIN_EVENT_KIND, type PendingApprovalDto } from '@bunker46/shared-types';
+import {
+  LOGIN_EVENT_KIND,
+  grantNeedsConfirmation,
+  type PendingApprovalDto,
+  type PermissionDescriptor,
+} from '@bunker46/shared-types';
 import { api } from '@/lib/api';
 import {
   $approvals,
@@ -28,10 +33,24 @@ const focusToken = computed(() =>
 
 const busy = ref('');
 const error = ref('');
-/** Token whose "always allow" is waiting for its second, confirming click. */
-const confirmingAlways = ref('');
-/** What the operator just did, by token, so the page can say so instead of "no longer waiting". */
+/** The card whose button is waiting for its second, confirming click, and which one. */
+const confirming = ref<{ token: string; action: 'once' | 'always' } | null>(null);
+const isConfirming = (a: PendingApprovalDto, action: 'once' | 'always') =>
+  confirming.value?.token === a.token && confirming.value.action === action;
+/**
+ * What the operator just did, by token. The card is replaced by a line saying so, of the same height,
+ * until it is dismissed (or the page is opened again): a card that vanished would pull the next one
+ * under the pointer, and a double click would answer a request the operator never read.
+ */
 const answered = ref<Record<string, string>>({});
+const heights = ref<Record<string, number>>({});
+const cardEls = new Map<string, HTMLElement>();
+function bindCard(token: string, el: unknown) {
+  const node =
+    el !== null && typeof el === 'object' && '$el' in el ? (el as { $el: unknown }).$el : el;
+  if (node instanceof HTMLElement) cardEls.set(token, node);
+  else cardEls.delete(token);
+}
 
 // A second-resolution clock for the countdowns.
 const now = ref(Date.now());
@@ -75,6 +94,9 @@ const isGone = (a: PendingApprovalDto) => !liveTokens.value.has(a.token);
 function dismiss(a: PendingApprovalDto) {
   finished.add(a.token);
   seen.value = seen.value.filter((x) => x.token !== a.token);
+  const rest = { ...answered.value };
+  delete rest[a.token];
+  answered.value = rest;
 }
 
 /** The link's request is gone: answered elsewhere, timed out, or the signer restarted. */
@@ -104,16 +126,19 @@ const METHOD_LABELS: Record<string, string> = {
   nip44_decrypt: 'Decrypt a message (NIP-44)',
 };
 
-/**
- * Kinds whose permanent grant is a blanket one: deleting events, authenticating to relays, signing
- * remote-signer messages, and HTTP auth (a login, and the confirmation of deleting an account).
- */
-const BLANKET_KINDS = new Set([5, 22242, 24133, LOGIN_EVENT_KIND]);
-
 const isLogin = (a: PendingApprovalDto) => a.method === 'sign_event' && a.kind === LOGIN_EVENT_KIND;
-/** "Always allow" is two clicks for these: any encrypt or decrypt, and the kinds above. */
-const needsSecondClick = (a: PendingApprovalDto) =>
-  a.method !== 'sign_event' || (a.kind !== undefined && BLANKET_KINDS.has(a.kind));
+const asPermission = (a: PendingApprovalDto): PermissionDescriptor => ({
+  method: a.method as PermissionDescriptor['method'],
+  kind: a.kind,
+});
+/**
+ * "Always allow" takes a second click, and is sent confirmed, for everything but an ordinary kind
+ * (shared with the server, which refuses it otherwise): any encrypt or decrypt, a login, deleting
+ * events, relay auth, a profile, a follow list, a seal, ...
+ */
+const alwaysNeedsConfirm = (a: PendingApprovalDto) => grantNeedsConfirmation(asPermission(a));
+/** The login's URL is not shown in full: allowing it, even once, is a second click. */
+const onceNeedsConfirm = (a: PendingApprovalDto) => a.preview?.httpAuth?.truncated === true;
 
 /** What always allowing it would let the app do, for the confirming warning. */
 function alwaysRisk(a: PendingApprovalDto): string {
@@ -123,7 +148,8 @@ function alwaysRisk(a: PendingApprovalDto): string {
   if (a.method === 'sign_event') {
     if (a.kind === 5) return 'ask relays to delete any of your events';
     if (a.kind === 22242) return 'authenticate to any relay as you';
-    return 'sign remote-signer messages as you, for any signer';
+    if (a.kind === 24133) return 'sign remote-signer messages as you, for any signer';
+    return `sign any event of kind ${a.kind ?? '?'} as you`;
   }
   if (a.method.endsWith('decrypt')) {
     return 'decrypt anything addressed to you, which is how your private messages are read';
@@ -150,24 +176,47 @@ const cardClass = (a: PendingApprovalDto) =>
 const hasPreview = (a: PendingApprovalDto) => {
   const p = a.preview;
   return (
-    !!p && !!(p.content || p.tags?.length || p.httpAuth || p.peer || p.ciphertextLength != null)
+    !!p &&
+    !!(
+      p.content ||
+      p.tags?.length ||
+      p.httpAuth ||
+      p.peer ||
+      p.ciphertextLength != null ||
+      p.eventTime ||
+      p.eventTimeOff
+    )
   );
 };
-/** A pubkey shortened to its first and last characters; the whole of it is in the tooltip. */
-const shortPeer = (peer: string) =>
-  peer.length > 20 ? `${peer.slice(0, 8)}…${peer.slice(-8)}` : peer;
+/**
+ * A key shortened to its first and last twelve characters, as an npub when the server gave one; the
+ * whole of it is in the tooltip.
+ */
+const shortKey = (text: string) =>
+  text.length > 26 ? `${text.slice(0, 12)}…${text.slice(-12)}` : text;
+const peerShown = (p: NonNullable<PendingApprovalDto['preview']>) =>
+  shortKey(p.peerNpub ?? p.peer ?? '');
+const peerTitle = (p: NonNullable<PendingApprovalDto['preview']>) => p.peerNpub ?? p.peer ?? '';
 
 type Action = 'once' | 'always' | 'deny';
 
 async function decide(a: PendingApprovalDto, action: Action) {
   busy.value = a.token;
   error.value = '';
+  // The card's height, before it is replaced by the line that says what was done.
+  heights.value = { ...heights.value, [a.token]: cardEls.get(a.token)?.offsetHeight ?? 0 };
   try {
     if (action === 'deny') {
       await api.post(`/approvals/${a.token}/deny`);
       answered.value = { ...answered.value, [a.token]: `Denied: ${a.connectionName} was refused.` };
     } else {
-      await api.post(`/approvals/${a.token}/approve`, { mode: action });
+      // The server refuses a permanent grant of anything but an ordinary kind without `confirm`.
+      await api.post(
+        `/approvals/${a.token}/approve`,
+        action === 'always' && alwaysNeedsConfirm(a)
+          ? { mode: action, confirm: true }
+          : { mode: action },
+      );
       answered.value = {
         ...answered.value,
         [a.token]:
@@ -176,26 +225,32 @@ async function decide(a: PendingApprovalDto, action: Action) {
             : `Allowed once: ${a.connectionName} is being answered.`,
       };
     }
-    // Answered here: the card gives way to the line above, it is not "gone".
-    finished.add(a.token);
-    seen.value = seen.value.filter((x) => x.token !== a.token);
+    // Answered here: the card gives way to a line saying so (same height), it is not "gone".
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Something went wrong.';
   } finally {
     busy.value = '';
-    confirmingAlways.value = '';
+    confirming.value = null;
     await refreshApprovals();
   }
 }
 
 function askAlways(a: PendingApprovalDto) {
   // A permanent grant of something this wide is worth a second look: it is not one request but every
-  // later one. Everything else is one click.
-  if (needsSecondClick(a) && confirmingAlways.value !== a.token) {
-    confirmingAlways.value = a.token;
+  // later one. An ordinary kind is one click.
+  if (alwaysNeedsConfirm(a) && !isConfirming(a, 'always')) {
+    confirming.value = { token: a.token, action: 'always' };
     return;
   }
   void decide(a, 'always');
+}
+
+function askOnce(a: PendingApprovalDto) {
+  if (onceNeedsConfirm(a) && !isConfirming(a, 'once')) {
+    confirming.value = { token: a.token, action: 'once' };
+    return;
+  }
+  void decide(a, 'once');
 }
 </script>
 
@@ -214,17 +269,6 @@ function askAlways(a: PendingApprovalDto) {
     <p v-if="error" class="text-sm text-destructive mb-4" role="alert">
       {{ error }}
     </p>
-
-    <!-- What the operator just did -->
-    <div
-      v-for="(text, token) in answered"
-      :key="token"
-      class="mb-4 rounded-lg border border-border bg-muted/40 px-4 py-3 text-sm flex items-center gap-2"
-      data-testid="approval-answered"
-    >
-      <ShieldCheck class="w-4 h-4 shrink-0 text-primary" />
-      {{ text }}
-    </div>
 
     <!-- The linked request is no longer waiting -->
     <div
@@ -265,148 +309,207 @@ function askAlways(a: PendingApprovalDto) {
     </div>
 
     <div v-else-if="loaded" class="space-y-4">
-      <Card
-        v-for="a in seen"
-        :key="a.token"
-        data-testid="approval-card"
-        :data-state="isGone(a) ? 'expired' : 'waiting'"
-        :class="cardClass(a)"
-      >
-        <div class="flex items-start justify-between gap-3 mb-3">
-          <div class="min-w-0">
-            <h2 class="font-semibold truncate">
-              {{ a.connectionName }}
-            </h2>
-            <p class="text-xs text-muted-foreground flex items-center gap-1">
-              <PubkeyDisplay :pubkey="a.clientPubkey" :truncate="true" />
-            </p>
-          </div>
-          <Badge v-if="isGone(a)" variant="secondary" data-testid="approval-expired">
-            No longer waiting
-          </Badge>
-          <Badge v-else :variant="secondsLeft(a) > 15 ? 'secondary' : 'destructive'">
-            <span data-testid="approval-countdown">{{ secondsLeft(a) }}s left</span>
-          </Badge>
-        </div>
-
-        <p class="font-medium">
-          {{ what(a) }}
-        </p>
-        <p class="text-xs font-mono text-muted-foreground mb-3">
-          {{ permission(a) }}
-        </p>
-
-        <!-- What it would do. Shown as text only, never as markup. -->
+      <template v-for="a in seen" :key="a.token">
+        <!-- Answered here: a line of the card's height, not a gap the next card slides into. -->
         <div
-          v-if="hasPreview(a)"
-          class="rounded-lg bg-muted/50 border border-border p-3 mb-3 text-sm"
-          data-testid="approval-preview"
+          v-if="answered[a.token]"
+          class="rounded-lg border border-border bg-muted/40 px-4 py-3 text-sm flex items-center justify-between gap-3"
+          data-testid="approval-tombstone"
+          :style="heights[a.token] ? { minHeight: `${heights[a.token]}px` } : undefined"
         >
-          <!-- A login: what it is FOR. Kind 27235 is also what confirms deleting an account. -->
-          <div
-            v-if="a.preview?.httpAuth"
-            class="rounded border border-amber-500/50 bg-amber-500/10 p-2 mb-2"
-            data-testid="approval-httpauth"
-          >
-            <p class="text-xs text-muted-foreground">This signature is for</p>
-            <p class="font-mono text-sm break-all">
-              <strong v-if="a.preview.httpAuth.method">{{ a.preview.httpAuth.method }}</strong>
-              {{ a.preview.httpAuth.host }}{{ a.preview.httpAuth.path }}{{ a.preview.httpAuth.url }}
-            </p>
-            <p v-if="a.preview.httpAuth.payload" class="text-xs text-muted-foreground break-all">
-              payload
-              <span class="font-mono">{{ a.preview.httpAuth.payload }}</span>
-            </p>
-          </div>
-
-          <!-- Encrypt and decrypt: with whom. -->
-          <p v-if="a.preview?.peer" class="text-xs mb-2" data-testid="approval-peer">
-            With
-            <span class="font-mono" :title="a.preview.peer">{{ shortPeer(a.preview.peer) }}</span>
-          </p>
-          <p
-            v-if="a.preview?.ciphertextLength != null"
-            class="text-xs text-muted-foreground mb-2"
-            data-testid="approval-ciphertext"
-          >
-            Ciphertext of {{ a.preview.ciphertextLength }} characters (not shown)
-          </p>
-
-          <pre v-if="a.preview?.content" class="whitespace-pre-wrap break-words font-mono text-xs"
-            >{{ a.preview.content }}{{ a.preview.contentTruncated ? ' …' : '' }}</pre>
-          <p
-            v-if="a.preview?.contentTruncated"
-            class="text-xs text-muted-foreground mt-1"
-            data-testid="approval-truncated"
-          >
-            Only the start is shown: the whole is {{ a.preview.contentLength }} characters.
-          </p>
-
-          <ul
-            v-if="a.preview?.tags?.length"
-            class="mt-2 space-y-0.5 text-xs"
-            data-testid="approval-tags"
-          >
-            <li v-for="(tag, i) in a.preview.tags" :key="i" class="font-mono break-all">
-              <span class="text-muted-foreground">{{ tag.name }}</span>
-              <span v-for="(value, j) in tag.values" :key="j" class="ml-2">{{ value }}</span>
-            </li>
-          </ul>
-          <p
-            v-if="
-              a.preview?.tagCount && a.preview.tags && a.preview.tagCount > a.preview.tags.length
-            "
-            class="text-xs text-muted-foreground mt-1"
-          >
-            … and {{ a.preview.tagCount - a.preview.tags.length }} more tags.
-          </p>
-        </div>
-
-        <div
-          v-if="confirmingAlways === a.token"
-          class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 mb-3 text-sm"
-          data-testid="approval-always-warning"
-        >
-          Always allowing this lets <strong>{{ a.connectionName }}</strong>
-          {{ alwaysRisk(a) }} without asking again. Choose <em>Allow once</em> to be asked each
-          time.
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          <Button
-            data-testid="approve-once"
-            :loading="busy === a.token"
-            :disabled="secondsLeft(a) === 0"
-            @click="decide(a, 'once')"
-          >
-            Allow once
-          </Button>
-          <Button
-            data-testid="approve-always"
-            variant="outline"
-            :disabled="busy === a.token || secondsLeft(a) === 0"
-            @click="askAlways(a)"
-          >
-            {{ confirmingAlways === a.token ? 'Yes, always allow' : 'Always allow' }}
-          </Button>
-          <Button
-            data-testid="deny"
-            variant="ghost"
-            :disabled="busy === a.token || isGone(a)"
-            @click="decide(a, 'deny')"
-          >
-            Deny
-          </Button>
-          <Button
-            v-if="isGone(a)"
-            data-testid="approval-dismiss"
-            variant="outline"
-            @click="dismiss(a)"
-          >
+          <span class="flex items-center gap-2" data-testid="approval-answered">
+            <ShieldCheck class="w-4 h-4 shrink-0 text-primary" />
+            {{ answered[a.token] }}
+          </span>
+          <Button data-testid="approval-tombstone-dismiss" variant="ghost" @click="dismiss(a)">
             Dismiss
           </Button>
         </div>
-      </Card>
+        <Card
+          v-else
+          :ref="(el: unknown) => bindCard(a.token, el)"
+          data-testid="approval-card"
+          :data-state="isGone(a) ? 'expired' : 'waiting'"
+          :class="cardClass(a)"
+        >
+          <div class="flex items-start justify-between gap-3 mb-3">
+            <div class="min-w-0">
+              <h2 class="font-semibold truncate">
+                {{ a.connectionName }}
+              </h2>
+              <p class="text-xs text-muted-foreground flex items-center gap-1">
+                <PubkeyDisplay :pubkey="a.clientPubkey" :truncate="true" />
+              </p>
+            </div>
+            <Badge v-if="isGone(a)" variant="secondary" data-testid="approval-expired">
+              No longer waiting
+            </Badge>
+            <Badge v-else :variant="secondsLeft(a) > 15 ? 'secondary' : 'destructive'">
+              <span data-testid="approval-countdown">{{ secondsLeft(a) }}s left</span>
+            </Badge>
+          </div>
+
+          <p class="font-medium">
+            {{ what(a) }}
+          </p>
+          <p class="text-xs font-mono text-muted-foreground mb-3">
+            {{ permission(a) }}
+          </p>
+
+          <!-- What it would do. Shown as text only, never as markup. -->
+          <div
+            v-if="hasPreview(a)"
+            class="rounded-lg bg-muted/50 border border-border p-3 mb-3 text-sm"
+            data-testid="approval-preview"
+          >
+            <!-- A login: what it is FOR. Kind 27235 is also what confirms deleting an account. -->
+            <div
+              v-if="a.preview?.httpAuth"
+              class="rounded border border-amber-500/50 bg-amber-500/10 p-2 mb-2"
+              data-testid="approval-httpauth"
+            >
+              <p class="text-xs text-muted-foreground">This signature is for</p>
+              <p class="font-mono text-sm break-all">
+                <strong v-if="a.preview.httpAuth.method">{{ a.preview.httpAuth.method }}</strong>
+                {{ a.preview.httpAuth.host }}{{ a.preview.httpAuth.path
+                }}{{ a.preview.httpAuth.url }}
+              </p>
+              <p v-if="a.preview.httpAuth.payload" class="text-xs text-muted-foreground break-all">
+                payload
+                <span class="font-mono">{{ a.preview.httpAuth.payload }}</span>
+              </p>
+              <p
+                v-if="a.preview.httpAuth.truncated"
+                class="mt-1 text-xs font-semibold text-destructive"
+                role="alert"
+                data-testid="approval-url-truncated"
+              >
+                URL longer than shown ({{ a.preview.httpAuth.urlLength }} chars): the end of it is
+                not shown.
+              </p>
+            </div>
+
+            <!-- When the event says it was made: a stale or far-future date is not "now". -->
+            <p
+              v-if="a.preview?.eventTime || a.preview?.eventTimeOff"
+              :class="[
+                'text-xs mb-2',
+                a.preview.eventTimeOff ? 'font-semibold text-amber-600' : 'text-muted-foreground',
+              ]"
+              data-testid="approval-event-time"
+            >
+              <template v-if="a.preview.eventTime">
+                Event dated {{ a.preview.eventTime }}
+                <template v-if="a.preview.eventTimeOff"> (more than a day from now)</template>
+              </template>
+              <template v-else>Event date is not a valid time</template>
+            </p>
+
+            <!-- Encrypt and decrypt: with whom. -->
+            <p v-if="a.preview?.peer" class="text-xs mb-2" data-testid="approval-peer">
+              With
+              <span class="font-mono" :title="peerTitle(a.preview)">{{
+                peerShown(a.preview)
+              }}</span>
+            </p>
+            <p
+              v-if="a.preview?.ciphertextLength != null"
+              class="text-xs text-muted-foreground mb-2"
+              data-testid="approval-ciphertext"
+            >
+              Ciphertext of {{ a.preview.ciphertextLength }} characters (not shown)
+            </p>
+
+            <pre v-if="a.preview?.content" class="whitespace-pre-wrap break-words font-mono text-xs"
+              >{{ a.preview.content }}{{ a.preview.contentTruncated ? ' …' : '' }}</pre>
+            <p
+              v-if="a.preview?.contentTruncated"
+              class="text-xs text-muted-foreground mt-1"
+              data-testid="approval-truncated"
+            >
+              Only the start is shown: the whole is {{ a.preview.contentLength }} characters.
+            </p>
+
+            <ul
+              v-if="a.preview?.tags?.length"
+              class="mt-2 space-y-0.5 text-xs"
+              data-testid="approval-tags"
+            >
+              <li v-for="(tag, i) in a.preview.tags" :key="i" class="font-mono break-all">
+                <span class="text-muted-foreground">{{ tag.name }}</span>
+                <span v-for="(value, j) in tag.values" :key="j" class="ml-2">{{ value }}</span>
+                <span v-if="tag.cut" class="ml-1 text-muted-foreground" title="Not shown in full"
+                  >…</span
+                >
+                <span v-if="tag.nonText" class="ml-2 text-muted-foreground"
+                  >(+{{ tag.nonText }} non-text tag values)</span
+                >
+              </li>
+            </ul>
+            <p
+              v-if="
+                a.preview?.tagCount && a.preview.tags && a.preview.tagCount > a.preview.tags.length
+              "
+              class="text-xs text-muted-foreground mt-1"
+            >
+              … and {{ a.preview.tagCount - a.preview.tags.length }} more tags.
+            </p>
+          </div>
+
+          <div
+            v-if="isConfirming(a, 'once')"
+            class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 mb-3 text-sm"
+            data-testid="approval-once-warning"
+          >
+            The URL this signs for is longer than what is shown above. Allow it only if you trust
+            <strong>{{ a.connectionName }}</strong> with the part you cannot see.
+          </div>
+          <div
+            v-if="isConfirming(a, 'always')"
+            class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 mb-3 text-sm"
+            data-testid="approval-always-warning"
+          >
+            Always allowing this lets <strong>{{ a.connectionName }}</strong>
+            {{ alwaysRisk(a) }} without asking again. Choose <em>Allow once</em> to be asked each
+            time.
+          </div>
+
+          <div class="flex flex-wrap gap-2">
+            <Button
+              data-testid="approve-once"
+              :loading="busy === a.token"
+              :disabled="secondsLeft(a) === 0"
+              @click="askOnce(a)"
+            >
+              {{ isConfirming(a, 'once') ? 'Yes, allow once' : 'Allow once' }}
+            </Button>
+            <Button
+              data-testid="approve-always"
+              variant="outline"
+              :disabled="busy === a.token || secondsLeft(a) === 0"
+              @click="askAlways(a)"
+            >
+              {{ isConfirming(a, 'always') ? 'Yes, always allow' : 'Always allow' }}
+            </Button>
+            <Button
+              data-testid="deny"
+              variant="ghost"
+              :disabled="busy === a.token || isGone(a)"
+              @click="decide(a, 'deny')"
+            >
+              Deny
+            </Button>
+            <Button
+              v-if="isGone(a)"
+              data-testid="approval-dismiss"
+              variant="outline"
+              @click="dismiss(a)"
+            >
+              Dismiss
+            </Button>
+          </div>
+        </Card>
+      </template>
     </div>
   </div>
 </template>

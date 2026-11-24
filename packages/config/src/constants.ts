@@ -52,8 +52,11 @@ export const APPROVAL_CONSTANTS = {
   TOKEN_BYTES: 24,
   /** Held requests one connection may have open at once; the next is answered as denied. */
   MAX_HOLDS_PER_CONNECTION: 10,
-  /** Held requests one user may have open at once (all their connections); below the global cap. */
-  MAX_HOLDS_PER_USER: 50,
+  /**
+   * Held requests one user may have open at once (all their connections). A quarter of the global
+   * cap: with registration open, four accounts could otherwise fill every hold there is.
+   */
+  MAX_HOLDS_PER_USER: 25,
   /** Held requests the whole signer may have open at once. */
   MAX_HOLDS_GLOBAL: 200,
   /** Pending permission rows kept per connection; the oldest go first. */
@@ -69,6 +72,15 @@ export const APPROVAL_CONSTANTS = {
   PREVIEW_TAG_NAME_MAX: 16,
   /** A peer pubkey is 64 hex characters; anything longer is cut. */
   PREVIEW_PEER_MAX: 64,
-  /** The path of the URL an HTTP-auth login is for. */
-  PREVIEW_URL_PART_MAX: 200,
+  /**
+   * The URL an HTTP-auth login is for, as shown (host, and path with query): long enough that the
+   * tail of a real URL is seen. One whose `u` is longer is not held at all, since it could not be shown.
+   */
+  PREVIEW_URL_MAX: 2048,
+  /** Waiters one hold has: the request and ONE retry of it (a client resend, a relay redelivery). */
+  MAX_WAITERS_PER_HOLD: 2,
+  /** The most characters of an encrypt or decrypt payload a request may carry to be held. */
+  MAX_HOLD_PAYLOAD_CHARS: 131_072,
+  /** How far an event's `created_at` may be from now before the preview flags it, in seconds. */
+  PREVIEW_TIME_SKEW_S: 86_400,
 } as const;

@@ -12,6 +12,8 @@ import type { ConnectionStatus as PrismaConnectionStatus } from '@/generated/pri
 import {
   checkPermission,
   DEFAULT_CONNECTION_PERMISSIONS,
+  formatPermission,
+  grantNeedsConfirmation,
   type ApprovalMode,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
@@ -160,26 +162,32 @@ export class ConnectionsService {
    * silently discards a client's outstanding permission request.
    */
   async setPermissions(connectionId: string, permissions: PermissionDescriptor[]) {
-    await this.prisma.connectionPermission.deleteMany({ where: { connectionId, allowed: true } });
-    if (permissions.length > 0) {
-      // Drop any pending row that is now being granted, to satisfy the (connectionId, method, kind)
-      // unique constraint before inserting the granted rows.
-      await this.prisma.connectionPermission.deleteMany({
-        where: {
-          connectionId,
-          allowed: false,
-          OR: permissions.map((p) => ({ method: p.method, kind: p.kind ?? null })),
-        },
-      });
-      await this.prisma.connectionPermission.createMany({
-        data: permissions.map((p) => ({
-          connectionId,
-          method: p.method,
-          kind: p.kind ?? null,
-          allowed: true,
-        })),
-      });
-    }
+    // Each permission once: a repeated entry would break the unique index halfway and, with the old
+    // grants already deleted, leave the connection with none.
+    const unique = [...new Map(permissions.map((p) => [permKey(p), p])).values()];
+    // One transaction, so the grants are replaced whole or not at all.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.connectionPermission.deleteMany({ where: { connectionId, allowed: true } });
+      if (unique.length > 0) {
+        // Drop any pending row that is now being granted, to satisfy the (connectionId, method,
+        // kind) unique constraint before inserting the granted rows.
+        await tx.connectionPermission.deleteMany({
+          where: {
+            connectionId,
+            allowed: false,
+            OR: unique.map((p) => ({ method: p.method, kind: p.kind ?? null })),
+          },
+        });
+        await tx.connectionPermission.createMany({
+          data: unique.map((p) => ({
+            connectionId,
+            method: p.method,
+            kind: p.kind ?? null,
+            allowed: true,
+          })),
+        });
+      }
+    });
   }
 
   /**
@@ -292,25 +300,66 @@ export class ConnectionsService {
     return updated;
   }
 
-  /** Operator approves pending permission requests (all, or a given subset), turning them into grants. */
+  /**
+   * Operator approves these pending permission requests, turning them into grants. Approving anything
+   * but an ordinary kind (see grantNeedsConfirmation: a login, a profile, a seal, any encrypt or
+   * decrypt, ...) needs `confirm`: the pending rows are filed by the client, so a hostile one can
+   * file exactly the rows an unattended click would turn into blanket grants.
+   */
   async approveRequests(
     connectionId: string,
     userId: string,
-    permissions?: PermissionDescriptor[],
+    permissions: PermissionDescriptor[],
+    confirm = false,
   ) {
     const conn = await this.prisma.bunkerConnection.findUnique({ where: { id: connectionId } });
     if (!conn || conn.userId !== userId) throw new NotFoundException();
+    // An empty list is nothing to approve, never "everything" (that is approveAllRequests).
+    if (permissions.length === 0) return;
+    const needing = permissions.filter(grantNeedsConfirmation);
+    if (needing.length > 0 && !confirm) {
+      throw new ConflictException(
+        `Approving ${needing.map(formatPermission).join(', ')} is a permanent, wide grant: confirm it explicitly`,
+      );
+    }
     await this.prisma.connectionPermission.updateMany({
       where: {
         connectionId,
         allowed: false,
-        ...(permissions?.length
-          ? { OR: permissions.map((p) => ({ method: p.method, kind: p.kind ?? null })) }
-          : {}),
+        OR: permissions.map((p) => ({ method: p.method, kind: p.kind ?? null })),
       },
       data: { allowed: true },
     });
     await this.eventsService.publishUserActivity(userId);
+  }
+
+  /**
+   * "Approve all": every pending request that is an ordinary kind. The ones that need an explicit
+   * confirmation (see approveRequests) stay pending and are counted, so one click on a list a client
+   * filled cannot grant them.
+   */
+  async approveAllRequests(connectionId: string, userId: string) {
+    const conn = await this.prisma.bunkerConnection.findUnique({ where: { id: connectionId } });
+    if (!conn || conn.userId !== userId) throw new NotFoundException();
+    const pending = await this.prisma.connectionPermission.findMany({
+      where: { connectionId, allowed: false },
+      select: { id: true, method: true, kind: true },
+    });
+    const ordinary = pending.filter(
+      (p) =>
+        !grantNeedsConfirmation({
+          method: p.method as PermissionDescriptor['method'],
+          kind: p.kind ?? undefined,
+        }),
+    );
+    if (ordinary.length > 0) {
+      await this.prisma.connectionPermission.updateMany({
+        where: { id: { in: ordinary.map((p) => p.id) }, connectionId, allowed: false },
+        data: { allowed: true },
+      });
+    }
+    await this.eventsService.publishUserActivity(userId);
+    return { approved: ordinary.length, needConfirmation: pending.length - ordinary.length };
   }
 
   /** Operator denies (deletes) pending permission requests (all, or a given subset). */

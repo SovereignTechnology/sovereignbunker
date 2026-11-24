@@ -268,6 +268,82 @@ describe.skipIf(!RUN)('hold-and-ask schema (DB integration)', () => {
     });
   });
 
+  describe('replacing and approving permissions', () => {
+    it('a list with a repeated entry stores it once and keeps every grant (it must not hit the unique index and wipe them)', async () => {
+      const { conn } = await seedConnection();
+      await service.setPermissions(conn.id, [{ method: 'sign_event', kind: 1 }]);
+
+      await service.setPermissions(conn.id, [
+        { method: 'sign_event', kind: 7 },
+        { method: 'sign_event', kind: 7 },
+        { method: 'nip44_decrypt' },
+        { method: 'nip44_decrypt' },
+      ]);
+
+      expect(await service.getPermissions(conn.id)).toEqual(
+        expect.arrayContaining([{ method: 'sign_event', kind: 7 }, { method: 'nip44_decrypt' }]),
+      );
+      expect(await prisma.connectionPermission.count({ where: { connectionId: conn.id } })).toBe(2);
+    });
+
+    it('"approve all" grants the ordinary kinds and leaves a login, a profile and a decrypt pending', async () => {
+      const { user, conn } = await seedConnection();
+      await service.requestPermissions(conn.id, [
+        { method: 'sign_event', kind: 1 },
+        { method: 'sign_event', kind: 7 },
+        { method: 'sign_event', kind: 27235 },
+        { method: 'sign_event', kind: 0 },
+        { method: 'nip44_decrypt' },
+      ]);
+
+      const result = await service.approveAllRequests(conn.id, user.id);
+
+      expect(result).toEqual({ approved: 2, needConfirmation: 3 });
+      expect(await service.getPermissions(conn.id)).toEqual(
+        expect.arrayContaining([
+          { method: 'sign_event', kind: 1 },
+          { method: 'sign_event', kind: 7 },
+        ]),
+      );
+      expect(await service.getPermissions(conn.id)).toHaveLength(2);
+      expect(
+        await prisma.connectionPermission.count({
+          where: { connectionId: conn.id, allowed: false },
+        }),
+      ).toBe(3);
+    });
+
+    it('"approve all" never touches someone else\'s connection', async () => {
+      const { conn } = await seedConnection();
+      const { user: stranger } = await seedKey();
+      await service.requestPermissions(conn.id, [{ method: 'sign_event', kind: 1 }]);
+      await expect(service.approveAllRequests(conn.id, stranger.id)).rejects.toThrow();
+      expect(await service.getPermissions(conn.id)).toEqual([]);
+    });
+
+    it('approving a wide request needs the confirmation, and with it grants exactly that one', async () => {
+      const { user, conn } = await seedConnection();
+      await service.requestPermissions(conn.id, [
+        { method: 'sign_event', kind: 27235 },
+        { method: 'sign_event', kind: 1 },
+      ]);
+      await expect(
+        service.approveRequests(conn.id, user.id, [{ method: 'sign_event', kind: 27235 }]),
+      ).rejects.toThrow(/confirm/);
+      expect(await service.getPermissions(conn.id)).toEqual([]);
+
+      await service.approveRequests(
+        conn.id,
+        user.id,
+        [{ method: 'sign_event', kind: 27235 }],
+        true,
+      );
+      expect(await service.getPermissions(conn.id)).toEqual([
+        { method: 'sign_event', kind: 27235 },
+      ]);
+    });
+  });
+
   describe('pending permission requests', () => {
     it('keeps the newest 50 per connection: a client probing kinds cannot grow the table without end', async () => {
       const { conn } = await seedConnection();

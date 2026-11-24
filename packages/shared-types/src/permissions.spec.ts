@@ -4,6 +4,8 @@ import {
   formatPermission,
   parsePermissionList,
   checkPermission,
+  grantNeedsConfirmation,
+  ORDINARY_EVENT_KINDS,
 } from './permissions';
 
 describe('permissions', () => {
@@ -68,4 +70,35 @@ describe('permissions', () => {
       ]);
     });
   });
+});
+
+describe('grantNeedsConfirmation', () => {
+  it('the ordinary kinds are 1, 6, 7 and 16, and nothing else', () => {
+    expect([...ORDINARY_EVENT_KINDS].sort((a, b) => a - b)).toEqual([1, 6, 7, 16]);
+  });
+
+  it.each([1, 6, 7, 16])('a grant of sign_event:%i needs no confirmation', (kind) => {
+    expect(grantNeedsConfirmation({ method: 'sign_event', kind })).toBe(false);
+  });
+
+  // The rule is inverted on purpose: a list of what is dangerous is always one entry short, so every
+  // kind that is not on the short ordinary list needs the second step.
+  it.each([
+    0, 2, 3, 4, 5, 8, 9, 13, 14, 15, 17, 40, 1059, 1984, 9734, 9735, 10002, 22242, 23194, 23195,
+    24133, 24242, 27235, 30023, 30078, 65535,
+  ])('a grant of sign_event:%i needs one', (kind) => {
+    expect(grantNeedsConfirmation({ method: 'sign_event', kind })).toBe(true);
+  });
+
+  it('every kind at once (sign_event with no kind) needs one', () => {
+    expect(grantNeedsConfirmation({ method: 'sign_event' })).toBe(true);
+  });
+
+  it.each(['nip04_encrypt', 'nip04_decrypt', 'nip44_encrypt', 'nip44_decrypt'] as const)(
+    '%s needs one, with or without a kind',
+    (method) => {
+      expect(grantNeedsConfirmation({ method })).toBe(true);
+      expect(grantNeedsConfirmation({ method, kind: 1 })).toBe(true);
+    },
+  );
 });

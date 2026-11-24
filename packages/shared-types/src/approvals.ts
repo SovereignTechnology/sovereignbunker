@@ -9,8 +9,14 @@ import { PermissionDescriptorSchema, MAX_PERMISSIONS_PER_REQUEST } from './permi
 export const ApprovalModeSchema = z.enum(['DENY', 'ASK']);
 export type ApprovalMode = z.infer<typeof ApprovalModeSchema>;
 
-/** POST /api/approvals/:token/approve. `once` signs this request only; `always` also grants it. */
-export const ApproveApprovalBodySchema = z.object({ mode: z.enum(['once', 'always']) }).strict();
+/**
+ * POST /api/approvals/:token/approve. `once` signs this request only; `always` also grants it for
+ * good, and for anything but an ordinary kind (see grantNeedsConfirmation) the server refuses that
+ * unless `confirm` is true: the second click lives in the page, so it cannot be the only gate.
+ */
+export const ApproveApprovalBodySchema = z
+  .object({ mode: z.enum(['once', 'always']), confirm: z.boolean().optional() })
+  .strict();
 export type ApproveApprovalBody = z.infer<typeof ApproveApprovalBodySchema>;
 
 /** PATCH /api/connections/:id/approval-mode */
@@ -22,10 +28,30 @@ export const PermissionListSchema = z
   .array(PermissionDescriptorSchema)
   .max(MAX_PERMISSIONS_PER_REQUEST);
 
+/**
+ * POST /api/connections/:id/permissions/approve: exactly these pending requests, never "all" (that is
+ * its own call, `approve-all`). `confirm` must be true when any of them needs it
+ * (grantNeedsConfirmation).
+ */
+export const ApprovePermissionsBodySchema = z
+  .object({ permissions: PermissionListSchema.min(1), confirm: z.boolean().optional() })
+  .strict();
+export type ApprovePermissionsBody = z.infer<typeof ApprovePermissionsBodySchema>;
+
+/** POST /api/connections/:id/permissions/deny: exactly these pending requests (`deny-all` is its own call). */
+export const DenyPermissionsBodySchema = z
+  .object({ permissions: PermissionListSchema.min(1) })
+  .strict();
+export type DenyPermissionsBody = z.infer<typeof DenyPermissionsBodySchema>;
+
 /** One tag of the event, as shown: its name and its first few values, each cleaned and cut. */
 export interface ApprovalTagPreview {
   name: string;
   values: string[];
+  /** How many of the tag's values are not text, and so not shown. */
+  nonText?: number;
+  /** True when a value shown is only the start of a longer one. */
+  cut?: boolean;
 }
 
 /**
@@ -41,6 +67,10 @@ export interface ApprovalHttpAuthPreview {
   url?: string;
   method?: string;
   payload?: string;
+  /** True when anything above is only the start of what was sent: the rest was never shown. */
+  truncated?: boolean;
+  /** How long `u` was, in characters, so a cut is never mistaken for all of it. */
+  urlLength?: number;
 }
 
 /**
@@ -59,8 +89,14 @@ export interface ApprovalPreviewDto {
   /** How many tags the event has in all (the list above is cut). */
   tagCount?: number;
   httpAuth?: ApprovalHttpAuthPreview;
-  /** The other party of an encrypt or decrypt request. */
+  /** The event's own `created_at`, as a date (ISO 8601). */
+  eventTime?: string;
+  /** True when that date is more than a day from now: a stale or future-dated event. */
+  eventTimeOff?: boolean;
+  /** The other party of an encrypt or decrypt request, as hex. */
   peer?: string;
+  /** The same key as an npub, for display. */
+  peerNpub?: string;
   /** How long the ciphertext of a decrypt request is (the ciphertext itself is never shown). */
   ciphertextLength?: number;
 }

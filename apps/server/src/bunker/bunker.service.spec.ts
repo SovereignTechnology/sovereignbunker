@@ -1472,24 +1472,57 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
-    it('a retry with a NEW event but the same request id shares the hold: one auth_url, one decision, an answer to each', async () => {
-      const { svc, real, publish } = await setup();
+    it('a retry with a NEW event but the same request id shares the hold: one auth_url and ONE answer', async () => {
+      const { svc, real, publish, passes } = await setup();
       const first = deliverEvent(svc, wireEvent('1'.repeat(64), loginRequest('req-7')));
       await settle();
-      const second = deliverEvent(svc, wireEvent('2'.repeat(64), loginRequest('req-7')));
-      await settle();
+      // The retry is acknowledged at once (so a redelivery of it is ignored): it adds no waiter of
+      // its own to answer, sign or log when the hold ends.
+      expect(await deliverEvent(svc, wireEvent('2'.repeat(64), loginRequest('req-7')))).toBe(true);
 
       // BIES treats a second auth_url for one id as a refusal: there must be exactly one.
       expect(real.list('user-1')).toHaveLength(1);
       expect(replies(publish).filter((r) => r['result'] === 'auth_url')).toHaveLength(1);
 
       real.resolve(real.list('user-1')[0]!.token, 'user-1', 'denied');
-      expect(await Promise.all([first, second])).toEqual([true, true]);
+      expect(await first).toBe(true);
       const finals = replies(publish).filter((r) => r['result'] !== 'auth_url');
-      expect(finals).toEqual([
-        { id: 'req-7', error: DENIED },
-        { id: 'req-7', error: DENIED },
-      ]);
+      expect(finals).toEqual([{ id: 'req-7', error: DENIED }]);
+      expect(passes.filter((p) => p.resolution !== undefined)).toHaveLength(1);
+      await svc.onModuleDestroy();
+    });
+
+    it('a client parking events under one request id gets ONE answer, ONE signature and ONE audit pass', async () => {
+      const { svc, real, publish, passes } = await setup();
+      const first = deliverEvent(svc, wireEvent('1'.repeat(64), loginRequest('req-9')));
+      await settle();
+      // Same id, same params, a different event id each time.
+      const others: boolean[] = [];
+      for (let i = 2; i <= 30; i++) {
+        others.push(
+          await deliverEvent(
+            svc,
+            wireEvent(
+              String(i % 10).repeat(60) + String(i).padStart(4, '0'),
+              loginRequest('req-9'),
+            ),
+          ),
+        );
+      }
+      // The retry is acknowledged; every one past it is dropped without being remembered, so a
+      // flood of them cannot push real event ids out of the replay guard.
+      expect(others[0]).toBe(true);
+      expect(others.slice(1).every((handled) => handled === false)).toBe(true);
+      expect(real.list('user-1')).toHaveLength(1);
+
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'approved_once');
+      // The first event still answers normally, whatever was parked beside it.
+      expect(await first).toBe(true);
+      const all = replies(publish);
+      expect(all.filter((r) => r['result'] === 'auth_url')).toHaveLength(1);
+      expect(all.filter((r) => r['result'] === SIGNED)).toEqual([{ id: 'req-9', result: SIGNED }]);
+      expect(all).toHaveLength(2);
+      expect(passes.filter((p) => p.resolution === 'approved_once')).toHaveLength(1);
       await svc.onModuleDestroy();
     });
 
@@ -1505,7 +1538,7 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
-    it('without PUBLIC_BASE_URL it still waits, but sends no interim', async () => {
+    it('a hold without a link to give sends no interim (the handler never opens one then: this is the service alone)', async () => {
       const { svc, real, publish } = await setup({ publicBaseUrl: undefined });
       const done = deliver(svc, loginRequest());
       await settle();

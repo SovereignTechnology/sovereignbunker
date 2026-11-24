@@ -478,7 +478,9 @@ function statusVariant(status: string) {
           <span v-for="p in importFlagged" :key="formatPermission(p)" class="font-mono mr-1">{{
             formatPermission(p)
           }}</span>
-          . It is not ticked above: grant it there only if you want this app to have it.
+          . These are wide permissions (a login, a profile, an encrypt or decrypt, ...) and need
+          your confirmation: they are not ticked above. Tick one there only if you mean this app to
+          have it for good. A login stays "ask each time" until you do.
         </p>
 
         <p v-if="error" class="text-sm text-destructive">

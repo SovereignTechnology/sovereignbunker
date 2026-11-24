@@ -93,5 +93,28 @@ export function isGatedMethod(method: string): method is (typeof GATED_PERMISSIO
  */
 export const LOGIN_EVENT_KIND = 27235;
 
+/**
+ * The event kinds ordinary enough that granting one for good needs no more than the click that grants
+ * it: a short note (1), a repost (6), a reaction (7) and a generic repost (16). EVERYTHING else (a
+ * profile, a follow list, a seal, a zap request, wallet-connect, Blossom or HTTP auth, event
+ * deletion, relay auth, remote-signer messages, ...) is a grant of something wide, and so is any
+ * encrypt or decrypt: those need an explicit confirmation. A list of what is dangerous would always
+ * be one entry short; this is the short list of what is not.
+ */
+export const ORDINARY_EVENT_KINDS: readonly number[] = [1, 6, 7, 16];
+
+/**
+ * True when granting this permission for good (or approving a request for it that is waiting in a
+ * list) needs the operator's explicit confirmation: the server refuses it without one, and the UI
+ * asks a second time. False only for `sign_event` of an ordinary kind (see ORDINARY_EVENT_KINDS).
+ */
+export function grantNeedsConfirmation(perm: PermissionDescriptor): boolean {
+  return !(
+    perm.method === 'sign_event' &&
+    perm.kind !== undefined &&
+    ORDINARY_EVENT_KINDS.includes(perm.kind)
+  );
+}
+
 /** A bound on any permission list that arrives over the API (the picker offers a few dozen at most). */
 export const MAX_PERMISSIONS_PER_REQUEST = 64;
