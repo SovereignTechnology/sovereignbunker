@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { Logger } from '@nestjs/common';
 import { generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
 import * as nip44 from 'nostr-tools/nip44';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
@@ -255,6 +256,24 @@ describe('BunkerService', () => {
 
       await svc.onModuleDestroy();
     });
+
+    it('one listener failing to re-open does not stop the others', async () => {
+      const { svc, subscribe, runWatchdog } = await makeService(new Map()); // every relay dropped
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), ['wss://relay.example.com']);
+      svc.startListeningForKey('d'.repeat(64), 'e'.repeat(64), ['wss://other.example.com']);
+      const listeners = (
+        svc as unknown as { activeListeners: Map<string, { reopen: (url: string) => void }> }
+      ).activeListeners;
+      listeners.get('a'.repeat(64))!.reopen = () => {
+        throw new Error('boom');
+      };
+
+      expect(() => runWatchdog()).not.toThrow();
+      // Two opened at start, plus the second listener's re-open.
+      expect(subscribe).toHaveBeenCalledTimes(3);
+
+      await svc.onModuleDestroy();
+    });
   });
 
   describe('replay guard', () => {
@@ -353,27 +372,53 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
-    it('ignores a request dated outside the accepted window', async () => {
+    it('accepts a request dated exactly at the edges of the window and drops one second beyond', async () => {
+      vi.useFakeTimers(); // the clock stands still, so the edges are exact
       const { svc, handle, onEventOfCall } = await makeService();
       svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
       const onevent = onEventOfCall(0);
       const W = NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S;
       const AHEAD = NOSTR_CONSTANTS.NIP46_FUTURE_SKEW_S;
 
-      await onevent(request('5'.repeat(64), W + 5));
-      await onevent(request('6'.repeat(64), -(AHEAD + 5)));
+      await onevent(request('5'.repeat(64), W + 1));
+      await onevent(request('6'.repeat(64), -(AHEAD + 1)));
       expect(handle).not.toHaveBeenCalled();
 
-      await onevent(request('7'.repeat(64), W - 5));
-      await onevent(request('8'.repeat(64), -(AHEAD - 5)));
+      await onevent(request('7'.repeat(64), W));
+      await onevent(request('8'.repeat(64), -AHEAD));
       expect(handle).toHaveBeenCalledTimes(2);
 
       await svc.onModuleDestroy();
     });
 
-    it('keeps a handled id for as long as its event can still be accepted', async () => {
-      // A subscription opened long ago still accepts everything newer than its fixed `since`, so
-      // the guard must not forget an id before the age gate would drop its event.
+    it('warns once a minute about requests dated outside the window, then goes quiet', async () => {
+      vi.useFakeTimers();
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const { svc, onEventOfCall } = await makeService();
+        svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+        const onevent = onEventOfCall(0);
+        const stale = NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S + 100;
+        const skewWarnings = () =>
+          warn.mock.calls.filter((c) => String(c[0]).includes("off this server's clock")).length;
+
+        await onevent(request('f1'.padEnd(64, '0'), stale));
+        await onevent(request('f2'.padEnd(64, '0'), stale));
+        expect(skewWarnings()).toBe(1);
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        await onevent(request('f3'.padEnd(64, '0'), stale));
+        expect(skewWarnings()).toBe(2);
+
+        await svc.onModuleDestroy();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('keeps a handled id exactly as long as its event can still be accepted', async () => {
+      // A subscription is long-lived, so the guard must not forget an id before the age gate would
+      // drop its event: at created_at + window the event is still accepted, one second later not.
       vi.useFakeTimers();
       const { svc, handle, onEventOfCall } = await makeService();
       svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
@@ -382,7 +427,7 @@ describe('BunkerService', () => {
       const event = request('9'.repeat(64));
       await onevent(event);
 
-      vi.setSystemTime((event.created_at + W - 1) * 1000); // the last second the gate accepts it
+      vi.setSystemTime((event.created_at + W) * 1000); // the last second the gate accepts it
       await onevent(event);
       expect(handle).toHaveBeenCalledTimes(1);
 
@@ -475,6 +520,56 @@ describe('BunkerService', () => {
       await first;
       await onevent(event);
       expect(handle).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('handles a request once when its listener is swapped while it is being answered', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      const key = ['a'.repeat(64), 'b'.repeat(64)] as const;
+      svc.startListeningForKey(...key, LISTEN);
+      let release = () => {};
+      handle.mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            release = () => resolve(true);
+          }),
+      );
+      const event = request('e1'.padEnd(64, '0'));
+      const first = onEventOfCall(0)(event);
+
+      // Another relay joins: the listener is rebuilt, and its relays hand the request back.
+      svc.startListeningForKey(...key, [...LISTEN, 'wss://other.example.com']);
+      await onEventOfCall(1)(event);
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      release();
+      await first;
+      await onEventOfCall(1)(event);
+      expect(handle).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('ignores events that reach a listener after it was stopped', async () => {
+      const { svc, handle, onEventOfCall } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+      const onevent = onEventOfCall(0);
+      svc.stopListeningForKey('a'.repeat(64));
+
+      await onevent(request('e2'.padEnd(64, '0')));
+      expect(handle).not.toHaveBeenCalled();
+
+      await svc.onModuleDestroy();
+    });
+
+    it('drops a stale self-ping of an earlier listener without handling or remembering it', async () => {
+      const { svc, handle, onEventOfCall, handled } = await makeService();
+      svc.startListeningForKey('a'.repeat(64), 'b'.repeat(64), LISTEN);
+
+      await onEventOfCall(0)({ ...request('e3'.padEnd(64, '0')), content: 'self-ping 7' });
+      expect(handle).not.toHaveBeenCalled();
+      expect(handled().size).toBe(0);
 
       await svc.onModuleDestroy();
     });
@@ -689,6 +784,65 @@ describe('BunkerService', () => {
       await svc.onModuleDestroy();
     });
 
+    it('opens one subscription per socket however a relay is spelled', async () => {
+      // nostr-tools treats wss://x, wss://x/ and a differently cased host as one connection; a
+      // subscription per spelling doubles them on it, and relays cap subscriptions per connection.
+      const { svc, subscribe, relaysOf } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [
+        'wss://r1.example.com',
+        'wss://r1.example.com/',
+        'wss://R1.example.com',
+        'wss://r2.example.com',
+      ]);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+      expect(relaysOf(0)).toEqual(['wss://r1.example.com']);
+      expect(relaysOf(1)).toEqual(['wss://r2.example.com']);
+
+      // Another spelling of a relay it already listens on is no new relay: nothing is rebuilt.
+      svc.startListeningForKey(PK, NSEC, ['wss://r2.example.com/']);
+      expect(subscribe).toHaveBeenCalledTimes(2);
+
+      await svc.onModuleDestroy();
+    });
+
+    it("keeps the filter's since at now minus the window whatever nostr-tools writes to it", async () => {
+      // On its own reconnect nostr-tools sets since = (newest event seen) + 1 on the object it was
+      // given, and our pings (server clock) or an event dated ahead would then blind the
+      // subscription to requests from a client with a slower clock.
+      vi.useFakeTimers();
+      const { svc, subscribe } = await makeService();
+      svc.startListeningForKey(PK, NSEC, ['wss://r1.example.com']);
+      const filter = subscribe.mock.calls[0]?.[1] as { since: number };
+      const W = NOSTR_CONSTANTS.NIP46_SINCE_WINDOW_S;
+      const sent = () => JSON.parse(JSON.stringify(filter)) as { since: number; kinds: number[] };
+
+      filter.since = 4_000_000_000; // what the library writes
+      expect(sent().since).toBe(Math.floor(Date.now() / 1000) - W);
+      expect(sent().kinds).toEqual([NOSTR_CONSTANTS.NIP46_KIND]);
+
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(sent().since).toBe(Math.floor(Date.now() / 1000) - W);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('does not close a subscription its relay already closed', async () => {
+      // nostr-tools counts a close down on the shared socket again, and the socket then idles out
+      // under the other signers' live subscriptions.
+      const { svc, paramsOf, closers } = await makeService();
+      svc.startListeningForKey(PK, NSEC, two);
+      paramsOf(0).onclose([
+        { url: 'wss://r1.example.com/', reason: 'error: too many subscriptions' },
+      ]);
+
+      svc.stopListeningForKey(PK);
+
+      expect(closers[0]).not.toHaveBeenCalled(); // r1: the relay closed it
+      expect(closers[1]).toHaveBeenCalledTimes(1); // r2: still ours to close
+
+      await svc.onModuleDestroy();
+    });
+
     it('re-opens only the relay whose connection dropped', async () => {
       const status = new Map([['wss://r2.example.com/', true]]);
       const { svc, subscribe, relaysOf } = await makeService(status);
@@ -833,6 +987,24 @@ describe('BunkerService', () => {
       await vi.advanceTimersByTimeAsync(3 * EVERY + WAIT + 1);
       expect(published).toHaveLength(4);
       expect(subscribe).toHaveBeenCalledTimes(1);
+
+      await svc.onModuleDestroy();
+    });
+
+    it('does not ping a relay whose subscription is waiting for its retry', async () => {
+      // The ping would go out while nothing listens; the retry then lands before the ping times
+      // out, and the silence would count as a miss.
+      vi.useFakeTimers();
+      const { svc, subscribe, published } = await makeService();
+      svc.startListeningForKey(PK, NSEC, [R1]);
+      await vi.advanceTimersByTimeAsync(FIRST - 1_000);
+      const params = subscribe.mock.calls[0]?.[2] as {
+        onclose: (reasons: { url: string; reason: string }[]) => void;
+      };
+      params.onclose([{ url: `${R1}/`, reason: 'error: too many subscriptions' }]); // retry at +5 s
+
+      await vi.advanceTimersByTimeAsync(1_000); // the round fires
+      expect(published).toHaveLength(0);
 
       await svc.onModuleDestroy();
     });
