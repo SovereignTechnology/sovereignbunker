@@ -149,7 +149,7 @@ describe('ConnectionsService', () => {
       ]);
     });
 
-    it('falls back to the default seed when the operator-chosen list is empty', async () => {
+    it('an empty operator-chosen list is a real choice: the connection starts able to do nothing', async () => {
       vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
         id: 'key-1',
         userId: 'user-1',
@@ -157,10 +157,66 @@ describe('ConnectionsService', () => {
 
       await service.createConnection('user-1', 'key-1', 'client-pub', { name: 'App' }, []);
 
+      // The UI says "starts able to do nothing until you grant some"; that is what is stored.
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+
+    it('only an omitted list falls back to the conservative defaults', async () => {
+      vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
+        id: 'key-1',
+        userId: 'user-1',
+      } as never);
+
+      await service.createConnection('user-1', 'key-1', 'client-pub', { name: 'App' }, undefined);
+
       const seedArg = vi.mocked(prisma.connectionPermission!.createMany!).mock.calls[0]?.[0] as {
         data: Array<{ method: string; kind: number | null }>;
       };
       expect(seedArg.data.map((p) => p.kind)).toEqual(expect.arrayContaining([0, 1, 3, 4, 7]));
+    });
+
+    it('does not seed the same permission twice, kind-less rows included', async () => {
+      vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
+        id: 'key-1',
+        userId: 'user-1',
+      } as never);
+
+      await service.createConnection('user-1', 'key-1', 'client-pub', { name: 'App' }, [
+        { method: 'nip44_decrypt' },
+        { method: 'nip44_decrypt' },
+        { method: 'sign_event', kind: 1 },
+        { method: 'sign_event', kind: 1 },
+      ]);
+
+      const seedArg = vi.mocked(prisma.connectionPermission!.createMany!).mock.calls[0]?.[0] as {
+        data: Array<{ method: string; kind: number | null }>;
+      };
+      expect(seedArg.data).toHaveLength(2);
+    });
+
+    it('defaults the approval mode to DENY, so existing behaviour is the default', async () => {
+      vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
+        id: 'key-1',
+        userId: 'user-1',
+      } as never);
+      await service.createConnection('user-1', 'key-1', 'client-pub', { name: 'App' });
+      expect(prisma.bunkerConnection?.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ approvalMode: 'DENY' }) }),
+      );
+    });
+
+    it('stores the approval mode it is given', async () => {
+      vi.mocked(prisma.nsecKey!.findFirst!).mockResolvedValue({
+        id: 'key-1',
+        userId: 'user-1',
+      } as never);
+      await service.createConnection('user-1', 'key-1', 'client-pub', {
+        name: 'App',
+        approvalMode: 'ASK',
+      });
+      expect(prisma.bunkerConnection?.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ approvalMode: 'ASK' }) }),
+      );
     });
 
     it('should throw NotFoundException when the nsec key does not belong to the user (C1)', async () => {
@@ -282,7 +338,7 @@ describe('ConnectionsService', () => {
   });
 
   describe('requestPermissions', () => {
-    it('records requested permissions as PENDING (allowed=false), skipping duplicates', async () => {
+    it('records requested permissions as PENDING (allowed=false)', async () => {
       await service.requestPermissions('conn-1', [
         { method: 'sign_event', kind: 1 },
         { method: 'nip44_decrypt' },
@@ -299,6 +355,129 @@ describe('ConnectionsService', () => {
     it('is a no-op for an empty request', async () => {
       await service.requestPermissions('conn-1', []);
       expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+
+    it('does not add a second pending row for a method-level request that is already pending', async () => {
+      // The unique index treats kind NULL rows as all different, so the database alone would insert
+      // a duplicate each time a client retried a denied nip44_decrypt.
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'nip44_decrypt', kind: null, allowed: false },
+      ] as never);
+      await service.requestPermissions('conn-1', [{ method: 'nip44_decrypt' }]);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+
+    it('does not add a pending row for a kind that is already pending', async () => {
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'sign_event', kind: 27235, allowed: false },
+      ] as never);
+      await service.requestPermissions('conn-1', [{ method: 'sign_event', kind: 27235 }]);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+
+    it('adds only what is new when a request mixes known and unknown permissions', async () => {
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'sign_event', kind: 1, allowed: false },
+      ] as never);
+      await service.requestPermissions('conn-1', [
+        { method: 'sign_event', kind: 1 },
+        { method: 'sign_event', kind: 7 },
+        { method: 'sign_event', kind: 7 },
+      ]);
+      expect(prisma.connectionPermission?.createMany).toHaveBeenCalledWith({
+        data: [{ connectionId: 'conn-1', method: 'sign_event', kind: 7, allowed: false }],
+        skipDuplicates: true,
+      });
+    });
+
+    it('never files a request a grant already covers', async () => {
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'sign_event', kind: null, allowed: true },
+      ] as never);
+      await service.requestPermissions('conn-1', [{ method: 'sign_event', kind: 5 }]);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('grantPermissions', () => {
+    it('throws NotFound when the connection is not the user\'s, and grants nothing', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'someone-else',
+      } as never);
+      await expect(
+        service.grantPermissions('conn-1', 'user-1', [{ method: 'sign_event', kind: 27235 }]),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+      expect(prisma.connectionPermission?.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('grants the permission and drops the pending row it replaces', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'user-1',
+      } as never);
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'sign_event', kind: 27235, allowed: false },
+      ] as never);
+
+      await service.grantPermissions('conn-1', 'user-1', [{ method: 'sign_event', kind: 27235 }]);
+
+      expect(prisma.connectionPermission?.deleteMany).toHaveBeenCalledWith({
+        where: {
+          connectionId: 'conn-1',
+          allowed: false,
+          OR: [{ method: 'sign_event', kind: 27235 }],
+        },
+      });
+      expect(prisma.connectionPermission?.createMany).toHaveBeenCalledWith({
+        data: [{ connectionId: 'conn-1', method: 'sign_event', kind: 27235, allowed: true }],
+      });
+      expect(eventsService.publishUserActivity).toHaveBeenCalledWith('user-1');
+    });
+
+    it('leaves an existing grant alone (no duplicate row)', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'user-1',
+      } as never);
+      vi.mocked(prisma.connectionPermission!.findMany!).mockResolvedValue([
+        { method: 'nip44_decrypt', kind: null, allowed: true },
+      ] as never);
+      await service.grantPermissions('conn-1', 'user-1', [{ method: 'nip44_decrypt' }]);
+      expect(prisma.connectionPermission?.createMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setApprovalMode', () => {
+    it('throws NotFound for a connection that is not the user\'s, and changes nothing', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'someone-else',
+      } as never);
+      await expect(service.setApprovalMode('conn-1', 'user-1', 'ASK')).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.bunkerConnection?.update).not.toHaveBeenCalled();
+    });
+
+    it('switches the mode for the owner and publishes activity', async () => {
+      vi.mocked(prisma.bunkerConnection!.findUnique!).mockResolvedValue({
+        id: 'conn-1',
+        userId: 'user-1',
+      } as never);
+      vi.mocked(prisma.bunkerConnection!.update!).mockResolvedValue({
+        id: 'conn-1',
+        approvalMode: 'ASK',
+      } as never);
+      await expect(service.setApprovalMode('conn-1', 'user-1', 'ASK')).resolves.toEqual({
+        id: 'conn-1',
+        approvalMode: 'ASK',
+      });
+      expect(prisma.bunkerConnection?.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'conn-1' }, data: { approvalMode: 'ASK' } }),
+      );
+      expect(eventsService.publishUserActivity).toHaveBeenCalledWith('user-1');
     });
   });
 

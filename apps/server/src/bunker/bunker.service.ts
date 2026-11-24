@@ -10,12 +10,15 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure
 import { hexToBytes } from '@noble/hashes/utils.js';
 import * as nip44 from 'nostr-tools/nip44';
 import * as nip04 from 'nostr-tools/nip04';
-import { BunkerRpcHandler } from './bunker-rpc.handler.js';
+import { BunkerRpcHandler, type RpcReply } from './bunker-rpc.handler.js';
+import { ApprovalService, type HeldRequest } from './approval.service.js';
 import {
   Nip46Method,
   Nip46RequestEnvelopeSchema,
   Nip46RequestSchema,
   SafeRelayUrlSchema,
+  type ApprovalMode,
+  type Nip46Request,
   type Nip46Response,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
@@ -70,6 +73,8 @@ export interface PendingSecretInfo {
   name: string;
   /** Operator-chosen granted permissions to seed the auto-created connection with (bunker:// flow). */
   permissions?: PermissionDescriptor[];
+  /** Whether the auto-created connection holds an ungranted request for the operator (ASK) or refuses it (DENY). */
+  approvalMode?: ApprovalMode;
 }
 
 @Injectable()
@@ -89,6 +94,7 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     private readonly encryption: EncryptionService,
     @Inject(NOSTR_DEFAULT_RELAYS_INJECTION_TOKEN)
     private readonly defaultRelays: string[],
+    private readonly approvals: ApprovalService,
   ) {
     this.pool = new SimplePool({ enablePing: true, enableReconnect: true });
   }
@@ -609,10 +615,36 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
       `NIP-46 ${parsed.data.method} from ${clientPubkey.slice(0, 12)}... (id: ${parsed.data.id})`,
     );
 
-    const response = await this.rpcHandler.handleRequest(
+    const reply = await this.runRpc(clientPubkey, signerPubkeyHex, parsed.data);
+
+    if (reply.hold) {
+      await this.answerHeldRequest(
+        reply.hold,
+        parsed.data,
+        clientPubkey,
+        signerPubkeyHex,
+        signerSecretKey,
+        relays,
+      );
+      // Answered (twice, in fact): the replay guard marks the event once this returns.
+      return true;
+    }
+
+    await this.sendResponse(reply, parsed.data.method, clientPubkey, signerSecretKey, relays);
+    return true;
+  }
+
+  /** Run one NIP-46 request through the RPC handler with this signer's crypto. */
+  private runRpc(
+    clientPubkey: string,
+    signerPubkeyHex: string,
+    request: Nip46Request,
+    resolution?: Parameters<BunkerRpcHandler['handleRequest']>[9],
+  ): Promise<RpcReply> {
+    return this.rpcHandler.handleRequest(
       clientPubkey,
       signerPubkeyHex,
-      parsed.data,
+      request,
       async (eventJson, nsec) => {
         const template = JSON.parse(eventJson);
         const sk = hexToBytes(nsec);
@@ -630,10 +662,56 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
         return nip44.v2.decrypt(ciphertext, ck);
       },
       (nsec) => getPublicKey(hexToBytes(nsec)),
+      resolution,
     );
+  }
 
-    await this.sendResponse(response, parsed.data.method, clientPubkey, signerSecretKey, relays);
-    return true;
+  /**
+   * A gated request on an ASK connection is waiting for the operator. NIP-46 lets a signer answer a
+   * request twice: first `{id, result: "auth_url", error: <url>}` ("go here, I need the user"), then
+   * the real reply under the same id. Exactly one interim reply is sent per request, because a client
+   * (nostr-tools) rejects the request if a second `auth_url` arrives for the same id.
+   *
+   * When the hold ends the request goes through the handler again with the outcome, so the final
+   * reply reflects the state of the connection NOW (revoked while held, permissions edited) and not
+   * what it was when the request arrived. A refusal or a timeout is the ordinary permission error,
+   * byte for byte, which is what clients already know how to read.
+   */
+  private async answerHeldRequest(
+    hold: HeldRequest,
+    request: Nip46Request,
+    clientPubkey: string,
+    signerPubkeyHex: string,
+    signerSecretKey: Uint8Array,
+    relays: string[],
+  ) {
+    const url = this.approvals.authUrl(hold.token);
+    if (url) {
+      await this.sendResponse(
+        { id: request.id, result: 'auth_url', error: url },
+        request.method,
+        clientPubkey,
+        signerSecretKey,
+        relays,
+      );
+    } else {
+      this.logger.warn(
+        'PUBLIC_BASE_URL is not set: holding the request without telling the client where to approve it',
+      );
+    }
+
+    const outcome = await hold.decision;
+
+    let final: Nip46Response;
+    try {
+      const reply = await this.runRpc(clientPubkey, signerPubkeyHex, request, outcome);
+      final = { id: reply.id, result: reply.result, error: reply.error };
+    } catch (err) {
+      // The client is still waiting under this id: it must get an answer, not silence.
+      this.logger.error(`Failed to answer held NIP-46 request: ${printable(err)}`);
+      final = { id: request.id, error: 'Internal error' };
+    }
+    await this.sendResponse(final, request.method, clientPubkey, signerSecretKey, relays);
   }
 
   /** Encrypt a NIP-46 response to the client and publish it on the listener's relays. */
@@ -644,7 +722,12 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
     signerSecretKey: Uint8Array,
     relays: string[],
   ) {
-    const responseJson = JSON.stringify(response);
+    // Explicit fields: whatever else a reply object carries (the handler's `hold`) never goes out.
+    const responseJson = JSON.stringify({
+      id: response.id,
+      result: response.result,
+      error: response.error,
+    });
     const conversationKey = nip44.v2.utils.getConversationKey(signerSecretKey, clientPubkey);
     const encryptedResponse = nip44.v2.encrypt(responseJson, conversationKey);
 

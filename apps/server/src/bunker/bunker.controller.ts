@@ -9,7 +9,13 @@ import {
   Inject,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { SafeRelayUrlsSchema, PermissionDescriptorSchema } from '@bunker46/shared-types';
+import {
+  ApprovalModeSchema,
+  PermissionListSchema,
+  SafeRelayUrlsSchema,
+  type ApprovalMode,
+  type PermissionDescriptor,
+} from '@bunker46/shared-types';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
 import { TotpVerifiedGuard } from '../auth/guards/totp-verified.guard.js';
 import { BunkerService } from './bunker.service.js';
@@ -50,17 +56,29 @@ export class BunkerController {
   @Post('generate-bunker-uri')
   async generateBunkerUri(
     @Req() req: AuthReq,
-    @Body() body: { nsecKeyId: string; name?: string; permissions?: unknown },
+    @Body()
+    body: { nsecKeyId: string; name?: string; permissions?: unknown; approvalMode?: unknown },
   ) {
     const key = await this.prisma.nsecKey.findUnique({ where: { id: body.nsecKeyId } });
     if (!key || key.userId !== req.user.sub) {
       throw new Error('Key not found');
     }
 
-    // Operator-chosen permission seed (default-deny, operator-authoritative). Validated and deduped;
-    // an absent/empty/invalid list leaves the connection to fall back to the conservative defaults.
-    const parsedPerms = PermissionDescriptorSchema.array().safeParse(body.permissions);
-    const permissions = parsedPerms.success ? parsedPerms.data : undefined;
+    // Operator-chosen permission seed (default-deny, operator-authoritative). Absent: the
+    // conservative defaults. Present: it is used as sent, an empty list included ("starts able to do
+    // nothing"), so one that does not validate is refused rather than silently swapped for defaults.
+    let permissions: PermissionDescriptor[] | undefined;
+    if (body.permissions !== undefined) {
+      const parsedPerms = PermissionListSchema.safeParse(body.permissions);
+      if (!parsedPerms.success) throw new BadRequestException('Invalid permissions list');
+      permissions = parsedPerms.data;
+    }
+    let approvalMode: ApprovalMode | undefined;
+    if (body.approvalMode !== undefined) {
+      const parsedMode = ApprovalModeSchema.safeParse(body.approvalMode);
+      if (!parsedMode.success) throw new BadRequestException('approvalMode must be DENY or ASK');
+      approvalMode = parsedMode.data;
+    }
 
     const relays = await this.getActiveRelaysForUser(req.user.sub);
     const secret = randomBytes(16).toString('hex');
@@ -70,6 +88,7 @@ export class BunkerController {
       nsecKeyId: body.nsecKeyId,
       name: body.name || 'Bunker46',
       permissions,
+      approvalMode,
     });
 
     await this.bunkerService.ensureListeningForConnection(body.nsecKeyId, req.user.sub, relays);

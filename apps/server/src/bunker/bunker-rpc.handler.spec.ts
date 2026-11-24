@@ -4,6 +4,7 @@ import type { ConnectionsService } from '../connections/connections.service.js';
 import type { LoggingService } from '../logging/logging.service.js';
 import type { EventsService } from '../events/events.service.js';
 import type { EncryptionService } from '../common/crypto/encryption.service.js';
+import type { ApprovalOutcome, ApprovalService, HeldRequest } from './approval.service.js';
 import type { Nip46Request } from '@bunker46/shared-types';
 
 type Perm = { method: string; kind?: number; allowed?: boolean };
@@ -14,6 +15,7 @@ describe('BunkerRpcHandler', () => {
   let loggingService: Partial<LoggingService>;
   let eventsService: Partial<EventsService>;
   let encryption: Partial<EncryptionService>;
+  let approvals: { open: ReturnType<typeof vi.fn> };
 
   const signEvent = vi.fn().mockResolvedValue('{"sig":"deadbeef"}');
   const nip04Encrypt = vi.fn().mockResolvedValue('enc04');
@@ -25,9 +27,15 @@ describe('BunkerRpcHandler', () => {
   const CLIENT = 'client-pubkey-hex';
   const SIGNER = 'signer-pubkey-hex';
 
-  function makeConnection(permissions: Perm[], status = 'ACTIVE', secret?: string) {
+  function makeConnection(
+    permissions: Perm[],
+    status = 'ACTIVE',
+    secret?: string,
+    approvalMode: 'DENY' | 'ASK' = 'DENY',
+  ) {
     return {
       id: 'conn-1',
+      approvalMode,
       userId: 'user-1',
       name: 'Test App',
       clientPubkey: CLIENT,
@@ -47,7 +55,7 @@ describe('BunkerRpcHandler', () => {
     return { id, method, params } as Nip46Request;
   }
 
-  function handle(req: Nip46Request) {
+  function handle(req: Nip46Request, resolution?: ApprovalOutcome) {
     return handler.handleRequest(
       CLIENT,
       SIGNER,
@@ -58,6 +66,7 @@ describe('BunkerRpcHandler', () => {
       nip44Encrypt,
       nip44Decrypt,
       getPublicKeyFromNsec,
+      resolution,
     );
   }
 
@@ -76,11 +85,13 @@ describe('BunkerRpcHandler', () => {
     loggingService = { logSigningAction: vi.fn().mockResolvedValue(undefined as never) };
     eventsService = { publishUserActivity: vi.fn().mockResolvedValue(undefined as never) };
     encryption = { decrypt: vi.fn().mockReturnValue('nsec-hex') };
+    approvals = { open: vi.fn() };
     handler = new BunkerRpcHandler(
       connections as ConnectionsService,
       loggingService as LoggingService,
       eventsService as EventsService,
       encryption as EncryptionService,
+      approvals as unknown as ApprovalService,
     );
   });
 
@@ -394,12 +405,246 @@ describe('BunkerRpcHandler', () => {
       expect(eventsService.publishUserActivity).toHaveBeenCalledWith('user-1');
     });
 
-    it('logs a permission-denied signing action as a non-approved result', async () => {
+    it('logs a permission refusal as DENIED, not as an ERROR', async () => {
       vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(makeConnection([]) as never);
       await handle(request('sign_event', [signEventJson(1)]));
       expect(loggingService.logSigningAction).toHaveBeenCalledWith(
-        expect.objectContaining({ method: 'sign_event', result: 'ERROR' }),
+        expect.objectContaining({
+          method: 'sign_event',
+          result: 'DENIED',
+          errorMessage: 'Permission denied for sign_event kind:1',
+        }),
       );
+    });
+
+    it('still logs a failure that is not a refusal as an ERROR', async () => {
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        makeConnection([{ method: 'nip44_encrypt' }]) as never,
+      );
+      await handle(request('nip44_encrypt', ['only-one-param']));
+      expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+        expect.objectContaining({ method: 'nip44_encrypt', result: 'ERROR' }),
+      );
+    });
+  });
+
+  describe('malformed sign_event kinds', () => {
+    it.each([
+      ['no kind at all', JSON.stringify({ content: 'x', tags: [] })],
+      ['a string kind', JSON.stringify({ kind: '1', content: 'x', tags: [] })],
+      ['a negative kind', JSON.stringify({ kind: -1, content: 'x', tags: [] })],
+      ['a fractional kind', JSON.stringify({ kind: 1.5, content: 'x', tags: [] })],
+    ])('refuses %s without filing a method-level permission request', async (_name, eventJson) => {
+      // A pending sign_event row without a kind means "every kind": approving it would grant all.
+      vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+        makeConnection([], 'ACTIVE', undefined, 'ASK') as never,
+      );
+      const res = await handle(request('sign_event', [eventJson]));
+      expect(res.error).toBe('Invalid event: kind must be a non-negative integer');
+      expect(res.hold).toBeUndefined();
+      expect(connections.requestPermissions).not.toHaveBeenCalled();
+      expect(approvals.open).not.toHaveBeenCalled();
+      expect(signEvent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('hold and ask (approvalMode ASK)', () => {
+    const LOGIN_KIND = 27235;
+    const loginEvent = JSON.stringify({
+      kind: LOGIN_KIND,
+      content: 'https://app.example/login',
+      tags: [
+        ['u', 'https://app.example/login'],
+        ['method', 'POST'],
+      ],
+    });
+    const DENIED_TEXT = `Permission denied for sign_event kind:${LOGIN_KIND}`;
+
+    const asking = (perms: Perm[] = [], mode: 'DENY' | 'ASK' = 'ASK') =>
+      vi
+        .mocked(connections.findByClientAndSigner!)
+        .mockResolvedValue(makeConnection(perms, 'ACTIVE', undefined, mode) as never);
+
+    const aHold = (): HeldRequest => ({ token: 'tok-1', decision: new Promise(() => undefined) });
+
+    it('never holds on a DENY connection: the request is refused at once, as before', async () => {
+      asking([], 'DENY');
+      const res = await handle(request('sign_event', [loginEvent]));
+      expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+      expect(approvals.open).not.toHaveBeenCalled();
+    });
+
+    it('holds a refused request instead of answering it, and tells the service how', async () => {
+      asking();
+      const hold = aHold();
+      approvals.open.mockReturnValue(hold);
+
+      const res = await handle(request('sign_event', [loginEvent]));
+
+      expect(res).toEqual({ id: 'req-1', hold });
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeUndefined();
+      expect(approvals.open).toHaveBeenCalledWith({
+        userId: 'user-1',
+        connectionId: 'conn-1',
+        connectionName: 'Test App',
+        clientPubkey: CLIENT,
+        requestId: 'req-1',
+        permission: { method: 'sign_event', kind: LOGIN_KIND },
+        preview: {
+          kind: LOGIN_KIND,
+          content: 'https://app.example/login',
+          contentTruncated: false,
+          tagNames: ['u', 'method'],
+        },
+      });
+      // Nothing is signed, and nothing is logged until the request is answered.
+      expect(signEvent).not.toHaveBeenCalled();
+      expect(loggingService.logSigningAction).not.toHaveBeenCalled();
+    });
+
+    it('still files the pending permission row, so the existing approvals list keeps working', async () => {
+      asking();
+      approvals.open.mockReturnValue(aHold());
+      await handle(request('sign_event', [loginEvent]));
+      expect(connections.requestPermissions).toHaveBeenCalledWith('conn-1', [
+        { method: 'sign_event', kind: LOGIN_KIND },
+      ]);
+    });
+
+    it('holds a refused decrypt as a method-level request, with no event preview', async () => {
+      asking();
+      approvals.open.mockReturnValue(aHold());
+      const res = await handle(request('nip44_decrypt', ['third-party-pubkey', 'ciphertext']));
+      expect(res.hold).toBeDefined();
+      expect(approvals.open).toHaveBeenCalledWith(
+        expect.objectContaining({ permission: { method: 'nip44_decrypt' }, preview: undefined }),
+      );
+    });
+
+    it('does not hold a request the connection may already make', async () => {
+      asking([{ method: 'sign_event', kind: LOGIN_KIND }]);
+      const res = await handle(request('sign_event', [loginEvent]));
+      expect(res.hold).toBeUndefined();
+      expect(res.result).toBe('{"sig":"deadbeef"}');
+      expect(approvals.open).not.toHaveBeenCalled();
+    });
+
+    it('does not hold the always-available methods', async () => {
+      asking();
+      const res = await handle(request('ping'));
+      expect(res).toEqual({ id: 'req-1', result: 'pong', error: undefined });
+      expect(approvals.open).not.toHaveBeenCalled();
+    });
+
+    it('does not count a PENDING row as a grant', async () => {
+      asking([{ method: 'sign_event', kind: LOGIN_KIND, allowed: false }]);
+      approvals.open.mockReturnValue(aHold());
+      const res = await handle(request('sign_event', [loginEvent]));
+      expect(res.hold).toBeDefined();
+      expect(signEvent).not.toHaveBeenCalled();
+    });
+
+    it('refuses with the ordinary text when no hold can be opened (caps reached)', async () => {
+      asking();
+      approvals.open.mockReturnValue(undefined);
+      const res = await handle(request('sign_event', [loginEvent]));
+      expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+      expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+        expect.objectContaining({ result: 'DENIED' }),
+      );
+    });
+
+    describe('when the hold ends', () => {
+      it('approve once: signs this request and grants nothing', async () => {
+        asking(); // the connection still holds no permission for kind 27235
+        const res = await handle(request('sign_event', [loginEvent]), 'approved_once');
+        expect(res).toEqual({ id: 'req-1', result: '{"sig":"deadbeef"}', error: undefined });
+        expect(signEvent).toHaveBeenCalledWith(loginEvent, 'nsec-hex');
+        expect(connections.setPermissions).not.toHaveBeenCalled();
+        expect(connections.requestPermissions).not.toHaveBeenCalled();
+        expect(approvals.open).not.toHaveBeenCalled();
+        expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            result: 'APPROVED',
+            eventKind: LOGIN_KIND,
+            metadata: { approval: 'approved_once' },
+          }),
+        );
+      });
+
+      it('approve once covers the held request only: the next one is held again', async () => {
+        asking();
+        await handle(request('sign_event', [loginEvent]), 'approved_once');
+        approvals.open.mockReturnValue(aHold());
+        const next = await handle(request('sign_event', [loginEvent], 'req-2'));
+        expect(next.hold).toBeDefined();
+      });
+
+      it('always allow: signs because the grant is now stored', async () => {
+        // The approvals API granted the permission before settling the hold.
+        asking([{ method: 'sign_event', kind: LOGIN_KIND }]);
+        const res = await handle(request('sign_event', [loginEvent]), 'approved_always');
+        expect(res.result).toBe('{"sig":"deadbeef"}');
+        expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            result: 'APPROVED',
+            metadata: { approval: 'approved_always' },
+          }),
+        );
+      });
+
+      it('always allow without a stored grant is a refusal, never a second hold', async () => {
+        asking(); // e.g. the grant failed or the permission was removed in the meantime
+        const res = await handle(request('sign_event', [loginEvent]), 'approved_always');
+        expect(res.error).toBe(DENIED_TEXT);
+        expect(res.hold).toBeUndefined();
+        expect(signEvent).not.toHaveBeenCalled();
+        expect(approvals.open).not.toHaveBeenCalled();
+      });
+
+      it.each(['denied', 'expired', 'cancelled'] as const)(
+        '%s: the unchanged permission text, logged as DENIED, nothing filed or held again',
+        async (outcome) => {
+          asking();
+          const res = await handle(request('sign_event', [loginEvent]), outcome);
+          // Byte for byte: BIES (signerError.js) matches this text.
+          expect(res).toEqual({ id: 'req-1', result: undefined, error: DENIED_TEXT });
+          expect(signEvent).not.toHaveBeenCalled();
+          expect(connections.requestPermissions).not.toHaveBeenCalled();
+          expect(approvals.open).not.toHaveBeenCalled();
+          expect(loggingService.logSigningAction).toHaveBeenCalledWith(
+            expect.objectContaining({
+              result: 'DENIED',
+              errorMessage: DENIED_TEXT,
+              metadata: { approval: outcome },
+            }),
+          );
+        },
+      );
+
+      it('a connection revoked while the request was held signs nothing, even if approved', async () => {
+        // findByClientAndSigner serves only ACTIVE/PENDING connections, so a revoked one is gone.
+        vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(null as never);
+        const res = await handle(request('sign_event', [loginEvent]), 'approved_once');
+        expect(res.error).toBe('Unknown client');
+        expect(signEvent).not.toHaveBeenCalled();
+      });
+
+      it('a connection that reads REVOKED when re-checked signs nothing', async () => {
+        vi.mocked(connections.findByClientAndSigner!).mockResolvedValue(
+          makeConnection([], 'REVOKED', undefined, 'ASK') as never,
+        );
+        const res = await handle(request('sign_event', [loginEvent]), 'approved_once');
+        expect(res.error).toBe('Connection revoked');
+        expect(signEvent).not.toHaveBeenCalled();
+      });
+
+      it('answers under the id the client sent', async () => {
+        asking();
+        const res = await handle(request('sign_event', [loginEvent], 'abc-123'), 'approved_once');
+        expect(res.id).toBe('abc-123');
+      });
     });
   });
 });

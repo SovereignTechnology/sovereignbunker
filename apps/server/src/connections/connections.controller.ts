@@ -20,9 +20,13 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
 import { TotpVerifiedGuard } from '../auth/guards/totp-verified.guard.js';
 import { ConnectionsService } from './connections.service.js';
 import { BunkerService } from '../bunker/bunker.service.js';
+import { ApprovalService } from '../bunker/approval.service.js';
 import {
-  parsePermissionList,
+  ApprovalModeSchema,
+  PermissionListSchema,
   SafeRelayUrlsSchema,
+  SetApprovalModeBodySchema,
+  type ApprovalMode,
   type PermissionDescriptor,
 } from '@bunker46/shared-types';
 import type { FastifyRequest } from 'fastify';
@@ -38,6 +42,8 @@ export class ConnectionsController {
     private readonly connectionsService: ConnectionsService,
     @Inject(forwardRef(() => BunkerService))
     private readonly bunkerService: BunkerService,
+    @Inject(forwardRef(() => ApprovalService))
+    private readonly approvals: ApprovalService,
   ) {}
 
   @Get()
@@ -99,7 +105,12 @@ export class ConnectionsController {
       relays?: string[];
       secret?: string;
       remotePubkey?: string;
-      perms?: string;
+      /** The permissions to GRANT, as picked by the operator. Absent: the conservative defaults. */
+      permissions?: unknown;
+      /** Removed: the old comma-separated string. Refused rather than ignored, see below. */
+      perms?: unknown;
+      /** DENY (default) or ASK: what happens to a gated request the connection holds no permission for. */
+      approvalMode?: unknown;
       type?: 'nostrconnect' | 'bunker';
     },
   ) {
@@ -113,26 +124,43 @@ export class ConnectionsController {
       }
       validatedRelays = parsed.data;
     }
+
+    // The old `perms` string used to be applied here, and any parse error was swallowed. A caller that
+    // still sends it would now get the default permissions without a word, so it is an error instead.
+    if (body.perms !== undefined) {
+      throw new BadRequestException('perms is no longer accepted: send permissions as a list');
+    }
+
+    // Validated, not parsed leniently: a list that does not validate is an error the caller sees, not
+    // a connection quietly created with other permissions than the operator chose. An empty list is a
+    // choice (the connection starts able to do nothing); only an absent one means the defaults.
+    let permissions: PermissionDescriptor[] | undefined;
+    if (body.permissions !== undefined) {
+      const parsedPerms = PermissionListSchema.safeParse(body.permissions);
+      if (!parsedPerms.success) throw new BadRequestException('Invalid permissions list');
+      permissions = parsedPerms.data;
+    }
+    let approvalMode: ApprovalMode | undefined;
+    if (body.approvalMode !== undefined) {
+      const parsedMode = ApprovalModeSchema.safeParse(body.approvalMode);
+      if (!parsedMode.success) throw new BadRequestException('approvalMode must be DENY or ASK');
+      approvalMode = parsedMode.data;
+    }
+
     const conn = await this.connectionsService.createConnection(
       req.user.sub,
       body.nsecKeyId,
       body.clientPubkey,
-      { ...body, relays: validatedRelays ?? body.relays },
+      {
+        name: body.name,
+        logoUrl: body.logoUrl,
+        relays: validatedRelays ?? body.relays,
+        secret: body.secret,
+        remotePubkey: body.remotePubkey,
+        approvalMode,
+      },
+      permissions,
     );
-
-    if (body.perms) {
-      try {
-        const permissions = parsePermissionList(body.perms);
-        // Only override the seeded default permissions when an explicit, non-empty set was supplied;
-        // an empty/invalid perms string leaves the conservative defaults in place (not a locked-out
-        // connection under the default-deny handler).
-        if (permissions.length > 0) {
-          await this.connectionsService.setPermissions(conn.id, permissions);
-        }
-      } catch {
-        // Invalid perms string - continue with the seeded default permissions
-      }
-    }
 
     await this.bunkerService.ensureListeningForConnection(
       body.nsecKeyId,
@@ -196,7 +224,25 @@ export class ConnectionsController {
     @Body() body: { status: 'ACTIVE' | 'REVOKED' },
   ) {
     await this.connectionsService.getConnection(id, req.user.sub);
-    return this.connectionsService.updateConnectionStatus(id, body.status);
+    const updated = await this.connectionsService.updateConnectionStatus(id, body.status);
+    // A revoked connection must not sign what it was holding: end the waits, so the clients get
+    // their answer now instead of when the hold times out.
+    if (body.status === 'REVOKED') this.approvals.cancelForConnection(id);
+    return updated;
+  }
+
+  @Patch(':id/approval-mode')
+  async setApprovalMode(
+    @Req() req: AuthReq,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    const parsed = SetApprovalModeBodySchema.safeParse(body);
+    if (!parsed.success) throw new BadRequestException('mode must be DENY or ASK');
+    const updated = await this.connectionsService.setApprovalMode(id, req.user.sub, parsed.data.mode);
+    // Back to DENY: whatever is being held is answered (as denied) now.
+    if (parsed.data.mode === 'DENY') this.approvals.cancelForConnection(id);
+    return updated;
   }
 
   @Patch(':id/logging')
@@ -212,5 +258,6 @@ export class ConnectionsController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Req() req: AuthReq, @Param('id') id: string) {
     await this.connectionsService.deleteConnection(id, req.user.sub);
+    this.approvals.cancelForConnection(id);
   }
 }

@@ -4,9 +4,17 @@ import { LoggingService } from '../logging/logging.service.js';
 import { EventsService } from '../events/events.service.js';
 import { EncryptionService } from '../common/crypto/encryption.service.js';
 import {
+  ApprovalService,
+  previewSignEvent,
+  type ApprovalOutcome,
+  type HeldRequest,
+} from './approval.service.js';
+import {
   checkPermission,
+  isGatedMethod,
   parsePermissionList,
   SafeRelayUrlSchema,
+  type ApprovalMode,
   type PermissionDescriptor,
   type Nip46Request,
   type Nip46Response,
@@ -18,7 +26,28 @@ type PendingSecretResult = {
   nsecKeyId: string;
   name: string;
   permissions?: PermissionDescriptor[];
+  approvalMode?: ApprovalMode;
 };
+
+/**
+ * The handler's answer. Usually a plain NIP-46 response. For a gated request on an `ASK` connection
+ * it carries `hold` instead of a result or an error: the request is waiting for the operator, the
+ * caller decides what to tell the client meanwhile, and calls the handler again with the decision.
+ * `hold` is never part of what goes on the wire.
+ */
+export type RpcReply = Nip46Response & { hold?: HeldRequest };
+
+/** The permission a request needs, or undefined for a method that is not gated (or a bad event). */
+function requiredPermission(request: Nip46Request): PermissionDescriptor | undefined {
+  if (!isGatedMethod(request.method)) return undefined;
+  if (request.method !== 'sign_event') return { method: request.method };
+  try {
+    const kind = (JSON.parse(request.params[0] ?? '') as { kind?: unknown }).kind;
+    return typeof kind === 'number' ? { method: 'sign_event', kind } : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 @Injectable()
 export class BunkerRpcHandler {
@@ -37,6 +66,7 @@ export class BunkerRpcHandler {
     private readonly loggingService: LoggingService,
     private readonly eventsService: EventsService,
     private readonly encryption: EncryptionService,
+    private readonly approvals: ApprovalService,
   ) {}
 
   setPendingSecretLookup(
@@ -67,7 +97,14 @@ export class BunkerRpcHandler {
       nsecHex: string,
     ) => Promise<string>,
     getPublicKeyFromNsec: (nsecHex: string) => string,
-  ): Promise<Nip46Response> {
+    /**
+     * Set when the caller answers a request it held for the operator: how the hold ended. The
+     * request is then handled again from scratch (connection and permissions are loaded afresh, so a
+     * connection revoked or edited during the wait is honoured), a one-time approval lifts the
+     * permission check for this request only, and a refusal is not held (or filed) a second time.
+     */
+    resolution?: ApprovalOutcome,
+  ): Promise<RpcReply> {
     const start = Date.now();
     let connection = await this.connections.findByClientAndSigner(clientPubkey, signerPubkey);
 
@@ -95,6 +132,13 @@ export class BunkerRpcHandler {
         method: p.method as PermissionDescriptor['method'],
         kind: p.kind ?? undefined,
       }));
+
+    // "Approve once": the operator allowed THIS request. Applied to the in-memory list only, never
+    // stored, and only for the permission this very request needs.
+    if (resolution === 'approved_once') {
+      const required = requiredPermission(request);
+      if (required) permissions.push(required);
+    }
 
     const nsecHex = this.encryption.decrypt(connection.nsecKey.encryptedNsec);
 
@@ -164,6 +208,12 @@ export class BunkerRpcHandler {
             break;
           }
           const parsed = JSON.parse(eventJson);
+          // A permission request is for one kind. An event without a usable kind must not be filed
+          // as a method-level request, which approving would turn into a grant for every kind.
+          if (!Number.isInteger(parsed?.kind) || parsed.kind < 0) {
+            error = 'Invalid event: kind must be a non-negative integer';
+            break;
+          }
           eventKind = parsed.kind;
 
           this.logger.log(
@@ -269,13 +319,35 @@ export class BunkerRpcHandler {
 
     // Surface a denied gated request as a PENDING permission request (allowed = false) so the operator
     // can approve it in the dashboard — the interactive approval flow extended to capabilities the
-    // client exercises at runtime, not just those it declared on connect. Recorded with skipDuplicates,
-    // so a client retrying the same method/kind cannot spam the queue, and it never downgrades a grant.
-    if (deniedPermission) {
+    // client exercises at runtime, not just those it declared on connect. Recorded once per
+    // method/kind (a client retrying the same request cannot spam the queue), and it never downgrades
+    // a grant. Not repeated when answering a request that was already held: that decision was made.
+    if (deniedPermission && resolution === undefined) {
       try {
         await this.connections.requestPermissions(connection.id, [deniedPermission]);
       } catch (err) {
         this.logger.warn(`Failed to record pending permission request: ${err}`);
+      }
+
+      // Hold and ask: on an ASK connection the denial becomes a wait for the operator. The caller
+      // tells the client to wait and answers when the hold ends. When no hold can be opened (too many
+      // are open), the request is simply denied, with the same text as ever.
+      if (connection.approvalMode === 'ASK') {
+        const hold = this.approvals.open({
+          userId: connection.userId,
+          connectionId: connection.id,
+          connectionName: connection.name,
+          clientPubkey: connection.clientPubkey,
+          requestId: request.id,
+          permission: deniedPermission,
+          preview: request.method === 'sign_event' ? previewSignEvent(request.params[0]) : undefined,
+        });
+        if (hold) {
+          this.logger.log(
+            `Holding ${request.method} for ${connection.name} until the operator decides`,
+          );
+          return { id: request.id, hold };
+        }
       }
     }
 
@@ -286,9 +358,11 @@ export class BunkerRpcHandler {
       clientPubkey: connection.clientPubkey,
       method: request.method,
       eventKind,
-      result: error ? 'ERROR' : 'APPROVED',
+      // A refusal for want of permission is a DENIED, not an ERROR (which is a failure to answer).
+      result: deniedPermission ? 'DENIED' : error ? 'ERROR' : 'APPROVED',
       durationMs,
       errorMessage: error,
+      metadata: resolution ? { approval: resolution } : undefined,
     });
     await this.eventsService.publishUserActivity(connection.userId);
 
@@ -335,6 +409,7 @@ export class BunkerRpcHandler {
           name: info.name,
           relays: [],
           secret,
+          approvalMode: info.approvalMode,
         },
         info.permissions,
       );

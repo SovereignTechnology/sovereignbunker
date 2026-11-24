@@ -6,6 +6,9 @@ import { NOSTR_CONSTANTS } from '@bunker46/config';
 import { BunkerService } from './bunker.service.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import type { BunkerRpcHandler } from './bunker-rpc.handler.js';
+import { ApprovalService } from './approval.service.js';
+import type { EventsService } from '../events/events.service.js';
+import type { Nip46Request } from '@bunker46/shared-types';
 import type { EncryptionService } from '../common/crypto/encryption.service.js';
 
 vi.mock('nostr-tools/pool', () => ({
@@ -25,9 +28,11 @@ describe('BunkerService', () => {
   let prisma: Partial<PrismaService>;
   let encryption: Partial<EncryptionService>;
   let rpcHandler: Partial<BunkerRpcHandler>;
+  let approvals: Partial<ApprovalService>;
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    approvals = { authUrl: vi.fn().mockReturnValue(undefined) };
     prisma = {
       nsecKey: {
         findMany: vi.fn().mockResolvedValue([]),
@@ -42,6 +47,7 @@ describe('BunkerService', () => {
       prisma as PrismaService,
       encryption as EncryptionService,
       [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
     );
     await service.onModuleInit();
   });
@@ -121,6 +127,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+        approvals as ApprovalService,
       );
 
       await svc.onModuleInit();
@@ -164,6 +171,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await service.onModuleInit();
       const pubkey = 'd'.repeat(64);
@@ -206,6 +214,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const runWatchdog = () => (svc as unknown as { checkConnections(): void }).checkConnections();
@@ -286,6 +295,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       // Count the requests that reach the decrypt-and-answer path without running it.
@@ -529,6 +539,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const relaysOf = (n: number) => subscribe.mock.calls[n]?.[0] as string[];
@@ -739,6 +750,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const internals = svc as unknown as { handleIncomingEvent: () => Promise<boolean> };
@@ -951,6 +963,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       return { svc, publish };
@@ -1031,6 +1044,7 @@ describe('BunkerService', () => {
         prisma as PrismaService,
         encryption as EncryptionService,
         [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+      approvals as ApprovalService,
       );
       await svc.onModuleInit();
       const internals = svc as unknown as {
@@ -1082,6 +1096,275 @@ describe('BunkerService', () => {
         expect.stringContaining('Failed to publish NIP-46 response'),
       );
 
+      await svc.onModuleDestroy();
+    });
+  });
+  describe('hold and ask', () => {
+    type OnEvent = (event: {
+      id: string;
+      pubkey: string;
+      content: string;
+      created_at: number;
+    }) => Promise<void>;
+
+    const signerSk = generateSecretKey();
+    const signerPk = getPublicKey(signerSk);
+    const signerNsec = bytesToHex(signerSk);
+    const clientSk = generateSecretKey();
+    const clientPk = getPublicKey(clientSk);
+    const relays = ['wss://r.example.com'];
+    const BASE = 'https://signer.example.test:50217';
+    const DENIED = 'Permission denied for sign_event kind:27235';
+    const SIGNED = '{"signed":true}';
+
+    /**
+     * A real ApprovalService and real nip44 on the wire; only the RPC handler is stubbed. It holds
+     * the first pass of a request and answers the second by the outcome it is handed, the way the
+     * real handler does (its own spec covers the decisions themselves).
+     */
+    async function setup(
+      opts: { publicBaseUrl?: string | undefined; recheckThrows?: boolean } = {},
+    ) {
+      const publicBaseUrl = 'publicBaseUrl' in opts ? opts.publicBaseUrl : BASE;
+      const poolModule = await import('nostr-tools/pool');
+      const subscribe = vi.fn().mockReturnValue({ close: vi.fn() });
+      const publish = vi.fn().mockReturnValue([Promise.resolve('ok')]);
+      vi.mocked(poolModule.SimplePool).mockImplementationOnce(function (this: unknown) {
+        return {
+          subscribe,
+          close: vi.fn(),
+          publish,
+          listConnectionStatus: vi.fn().mockReturnValue(new Map<string, boolean>()),
+        };
+      });
+      const real = new ApprovalService(
+        { ttlMs: 100_000, publicBaseUrl },
+        { publishUserActivity: vi.fn().mockResolvedValue(undefined) } as unknown as EventsService,
+      );
+      const passes: Array<{ id: string; resolution: unknown }> = [];
+      const handleRequest = vi.fn(async (...args: unknown[]) => {
+        const req = args[2] as Nip46Request;
+        const resolution = args[9];
+        passes.push({ id: req.id, resolution });
+        if (resolution === undefined) {
+          const hold = real.open({
+            userId: 'user-1',
+            connectionId: 'conn-1',
+            connectionName: 'BIES',
+            clientPubkey: clientPk,
+            requestId: req.id,
+            permission: { method: 'sign_event', kind: 27235 },
+          })!;
+          return { id: req.id, hold };
+        }
+        if (opts.recheckThrows) throw new Error('database is down');
+        if (resolution === 'approved_once' || resolution === 'approved_always') {
+          return { id: req.id, result: SIGNED };
+        }
+        return { id: req.id, error: DENIED };
+      });
+      const handler = {
+        setPendingSecretLookup: vi.fn(),
+        setBaseRelayLookup: vi.fn(),
+        handleRequest,
+      } as unknown as BunkerRpcHandler;
+      const svc = new BunkerService(
+        handler,
+        prisma as PrismaService,
+        encryption as EncryptionService,
+        [...NOSTR_CONSTANTS.DEFAULT_RELAYS],
+        real,
+      );
+      await svc.onModuleInit();
+      return { svc, real, publish, subscribe, handleRequest, passes };
+    }
+
+    const ck = () => nip44.v2.utils.getConversationKey(clientSk, signerPk);
+    const wireEvent = (id: string, request: unknown) => ({
+      id,
+      pubkey: clientPk,
+      content: nip44.v2.encrypt(JSON.stringify(request), ck()),
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    const loginRequest = (id = 'req-1') => ({
+      id,
+      method: 'sign_event',
+      params: [JSON.stringify({ kind: 27235, content: '', tags: [] })],
+    });
+    const deliver = (svc: BunkerService, request: unknown) =>
+      (
+        svc as unknown as {
+          handleIncomingEvent(e: object, nsec: string, pk: string, r: string[]): Promise<boolean>;
+        }
+      ).handleIncomingEvent(wireEvent('e'.repeat(64), request), signerNsec, signerPk, relays);
+    const replies = (publish: ReturnType<typeof vi.fn>) =>
+      publish.mock.calls.map(([, event]) => {
+        const e = event as { content: string };
+        return JSON.parse(nip44.v2.decrypt(e.content, ck())) as Record<string, unknown>;
+      });
+    // Let queued promise callbacks run (setImmediate is not faked below).
+    const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('sends ONE interim auth_url, then the final reply under the same id (approve once)', async () => {
+      const { svc, real, publish, passes } = await setup();
+      const done = deliver(svc, loginRequest('req-42'));
+      await settle();
+
+      // While the operator decides: exactly the interim, nothing else.
+      const held = real.list('user-1');
+      expect(held).toHaveLength(1);
+      expect(replies(publish)).toEqual([
+        { id: 'req-42', result: 'auth_url', error: `${BASE}/approvals/${held[0]!.token}` },
+      ]);
+
+      real.resolve(held[0]!.token, 'user-1', 'approved_once');
+      // true: the request was answered (twice), which is what lets the replay guard remember it.
+      expect(await done).toBe(true);
+
+      const all = replies(publish);
+      expect(all).toHaveLength(2);
+      expect(all[1]).toEqual({ id: 'req-42', result: SIGNED });
+      expect(all.filter((r) => r['result'] === 'auth_url')).toHaveLength(1);
+      // The request went through the handler again, told how the hold ended.
+      expect(passes).toEqual([
+        { id: 'req-42', resolution: undefined },
+        { id: 'req-42', resolution: 'approved_once' },
+      ]);
+      await svc.onModuleDestroy();
+    });
+
+    it('always allow: the handler is told, and the client gets the signature', async () => {
+      const { svc, real, publish, passes } = await setup();
+      const done = deliver(svc, loginRequest());
+      await settle();
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'approved_always');
+      await done;
+      expect(passes[1]?.resolution).toBe('approved_always');
+      expect(replies(publish)[1]).toEqual({ id: 'req-1', result: SIGNED });
+      await svc.onModuleDestroy();
+    });
+
+    it('deny: the final reply is the unchanged permission text', async () => {
+      const { svc, real, publish, passes } = await setup();
+      const done = deliver(svc, loginRequest());
+      await settle();
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'denied');
+      expect(await done).toBe(true);
+      expect(passes[1]?.resolution).toBe('denied');
+      expect(replies(publish)[1]).toEqual({ id: 'req-1', error: DENIED });
+      await svc.onModuleDestroy();
+    });
+
+    it('timeout: answered as denied once the TTL passes, with no reply before that', async () => {
+      const { svc, publish, passes } = await setup();
+      const done = deliver(svc, loginRequest());
+      await settle();
+
+      vi.advanceTimersByTime(99_999);
+      await settle();
+      expect(replies(publish)).toHaveLength(1); // still just the interim
+
+      vi.advanceTimersByTime(1);
+      expect(await done).toBe(true);
+      expect(passes[1]?.resolution).toBe('expired');
+      expect(replies(publish)[1]).toEqual({ id: 'req-1', error: DENIED });
+      await svc.onModuleDestroy();
+    });
+
+    it('revoked or deleted while held: the wait ends at once and is re-checked as cancelled', async () => {
+      const { svc, real, publish, passes } = await setup();
+      const done = deliver(svc, loginRequest());
+      await settle();
+      real.cancelForConnection('conn-1');
+      await done;
+      expect(passes[1]?.resolution).toBe('cancelled');
+      expect(replies(publish)[1]).toEqual({ id: 'req-1', error: DENIED });
+      await svc.onModuleDestroy();
+    });
+
+    it('without PUBLIC_BASE_URL it still waits, but sends no interim', async () => {
+      const { svc, real, publish } = await setup({ publicBaseUrl: undefined });
+      const done = deliver(svc, loginRequest());
+      await settle();
+      expect(publish).not.toHaveBeenCalled();
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'approved_once');
+      await done;
+      expect(replies(publish)).toEqual([{ id: 'req-1', result: SIGNED }]);
+      await svc.onModuleDestroy();
+    });
+
+    it('answers even when the re-check fails: the client is never left waiting in silence', async () => {
+      const { svc, real, publish } = await setup({ recheckThrows: true });
+      const done = deliver(svc, loginRequest());
+      await settle();
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'approved_once');
+      // Answered with an error, but answered: a re-delivery must not be held and asked again.
+      expect(await done).toBe(true);
+      expect(replies(publish)[1]).toEqual({ id: 'req-1', error: 'Internal error' });
+      await svc.onModuleDestroy();
+    });
+
+    it('never puts the hold, or its token, anywhere but the interim link', async () => {
+      const { svc, real, publish } = await setup();
+      const done = deliver(svc, loginRequest());
+      await settle();
+      const { token } = real.list('user-1')[0]!;
+      real.resolve(token, 'user-1', 'approved_once');
+      await done;
+
+      const all = replies(publish);
+      for (const reply of all) {
+        expect(Object.keys(reply).every((k) => ['id', 'result', 'error'].includes(k))).toBe(true);
+      }
+      expect(JSON.stringify(all[1])).not.toContain(token);
+      await svc.onModuleDestroy();
+    });
+
+    it('a request that is not held gets exactly one reply and no interim', async () => {
+      const { svc, publish, handleRequest } = await setup();
+      handleRequest.mockResolvedValueOnce({ id: 'p1', result: 'pong' } as never);
+      await deliver(svc, { id: 'p1', method: 'ping', params: [] });
+      expect(replies(publish)).toEqual([{ id: 'p1', result: 'pong' }]);
+      await svc.onModuleDestroy();
+    });
+
+    it('a request re-delivered by a relay while it is held is not held a second time', async () => {
+      const { svc, real, publish, subscribe, handleRequest } = await setup();
+      svc.startListeningForKey(signerPk, signerNsec, relays);
+      const onevent = (subscribe.mock.calls[0]?.[2] as { onevent: OnEvent }).onevent;
+      const event = wireEvent('f'.repeat(64), loginRequest('req-9'));
+
+      const first = onevent(event);
+      await settle();
+      await onevent(event); // the relay hands it back, e.g. after a re-subscribe
+      await onevent(event);
+
+      expect(handleRequest).toHaveBeenCalledTimes(1);
+      expect(real.list('user-1')).toHaveLength(1);
+      expect(replies(publish).filter((r) => r['result'] === 'auth_url')).toHaveLength(1);
+
+      // Nothing is remembered while the request is waiting: the guard marks it only once answered.
+      const remembered = () =>
+        (svc as unknown as { handledEventIds: Map<string, number> }).handledEventIds.size;
+      expect(remembered()).toBe(0);
+
+      real.resolve(real.list('user-1')[0]!.token, 'user-1', 'approved_once');
+      await first;
+      expect(remembered()).toBe(1);
+
+      // Answered, so a copy that arrives afterwards is dropped: it is neither held nor signed again.
+      const passesBefore = handleRequest.mock.calls.length;
+      await onevent(event);
+      expect(handleRequest.mock.calls.length).toBe(passesBefore);
+      expect(real.size).toBe(0);
+      expect(replies(publish).filter((r) => r['result'] === SIGNED)).toHaveLength(1);
       await svc.onModuleDestroy();
     });
   });
