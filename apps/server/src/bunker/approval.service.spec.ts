@@ -388,7 +388,8 @@ describe('previewSignEvent', () => {
       contentLength: 5,
       tagCount: 3,
       tags: [
-        { name: 'e', values: ['abc', 'wss://relay.example', 'root'] },
+        // The fourth value is not shown, and the tag says so.
+        { name: 'e', values: ['abc', 'wss://relay.example', 'root'], cut: true },
         { name: 'p', values: ['def'] },
         { name: 't', values: [] },
       ],
