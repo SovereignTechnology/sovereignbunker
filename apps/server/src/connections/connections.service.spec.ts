@@ -333,7 +333,6 @@ describe('ConnectionsService', () => {
           { connectionId: 'conn-1', method: 'sign_event', kind: 1, allowed: true },
           { connectionId: 'conn-1', method: 'ping', kind: null, allowed: true },
         ],
-        skipDuplicates: true,
       });
     });
   });
@@ -433,6 +432,7 @@ describe('ConnectionsService', () => {
       });
       expect(prisma.connectionPermission?.createMany).toHaveBeenCalledWith({
         data: [{ connectionId: 'conn-1', method: 'sign_event', kind: 27235, allowed: true }],
+        skipDuplicates: true,
       });
       expect(eventsService.publishUserActivity).toHaveBeenCalledWith('user-1');
     });

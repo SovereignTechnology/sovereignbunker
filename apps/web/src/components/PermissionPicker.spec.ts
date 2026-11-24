@@ -98,7 +98,10 @@ describe('PermissionPicker', () => {
     });
 
     it('stops adding kinds at the server limit of 64 entries', async () => {
-      const full = Array.from({ length: 64 }, (_, i) => ({ method: 'sign_event', kind: i }));
+      const full: PermissionDescriptor[] = Array.from({ length: 64 }, (_, i) => ({
+        method: 'sign_event',
+        kind: i,
+      }));
       const { w, permissions } = mountPicker(full);
       await w.get('[data-testid="perm-kind-input"]').setValue('5000');
       await w.get('[data-testid="perm-add-kind"]').trigger('click');
