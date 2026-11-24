@@ -128,7 +128,7 @@ describe('BunkerService', () => {
 
     it('should use default relays when empty array passed', async () => {
       const poolModule = await import('nostr-tools/pool');
-      service.startListeningForKey('f'.repeat(64), 'g'.repeat(64), []);
+      service.startListeningForKey('f'.repeat(64), 'e'.repeat(64), []);
       const poolInstance = vi.mocked(poolModule.SimplePool).mock.results.at(-1)?.value;
       expect(poolInstance?.subscribe).toHaveBeenCalled();
       const [relays] = (poolInstance?.subscribe as ReturnType<typeof vi.fn>)?.mock.calls[0] ?? [];

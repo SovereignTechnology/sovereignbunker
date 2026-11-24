@@ -292,6 +292,9 @@ export class BunkerService implements OnModuleInit, OnModuleDestroy {
 
     const open = (url: string) => {
       let closedByUs = false;
+      // Assigned after the callbacks below that compare against it, so it cannot be a const (reading it
+      // from an onclose that fires before the assignment must see undefined, not a TDZ error).
+      // eslint-disable-next-line prefer-const
       let handle: { close: () => void } | undefined;
       const sub = this.pool.subscribe(
         [url],
