@@ -1,0 +1,97 @@
+# SovereignBunker release build.
+#
+# Builds the server and web OCI images from source on a GitHub-hosted runner and publishes NOTHING: no
+# registry login, no push, no secrets. The images are uploaded as a workflow artifact together with SHA256SUMS,
+# and our deploy (sovtech/l5400 kata/bunker46/import-image.sh) imports them by digest only after checking each
+# tar against the sums printed in THIS run's log, not against the artifact's own file.
+#
+# Triggers: a `sovtech-v*` tag, which must point at a commit already in main, or a manual run (images are then
+# named dev-<sha12>, which the importer refuses to deploy). CI (ci.yml) runs first through workflow_call, so a
+# release cannot skip lint, unit, migration and e2e checks. Every action is pinned to a commit SHA.
+name: sovtech-release
+
+on:
+  push:
+    tags: ['sovtech-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  images:
+    name: Build OCI images (server + web)
+    needs: [ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (full history, no stored token)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Name the images and check the tag is on main
+        id: ref
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            [[ "$GITHUB_REF_NAME" =~ ^sovtech-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] ||
+              { echo "::error::tag '$GITHUB_REF_NAME' is not sovtech-vMAJOR.MINOR.PATCH[-suffix]"; exit 1; }
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+              { echo "::error::tag $GITHUB_REF_NAME ($GITHUB_SHA) is not in main"; exit 1; }
+            name="$GITHUB_REF_NAME"
+          else
+            name="dev-${GITHUB_SHA::12}"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "image tag: $name  source commit: $GITHUB_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build server image (apps/server/Dockerfile, target production)
+        env:
+          IMAGE_TAG: ${{ steps.ref.outputs.name }}
+        run: |
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            -f apps/server/Dockerfile --target production \
+            --metadata-file server-meta.json \
+            --output "type=oci,dest=sovereignbunker-server.oci.tar,name=docker.io/kata/sovereignbunker-server:${IMAGE_TAG}" .
+
+      - name: Build web image (apps/web/Dockerfile, target production)
+        env:
+          IMAGE_TAG: ${{ steps.ref.outputs.name }}
+        run: |
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            -f apps/web/Dockerfile --target production \
+            --metadata-file web-meta.json \
+            --output "type=oci,dest=sovereignbunker-web.oci.tar,name=docker.io/kata/sovereignbunker-web:${IMAGE_TAG}" .
+
+      - name: Checksums and build metadata (the importer compares against this log)
+        run: |
+          sha256sum sovereignbunker-server.oci.tar sovereignbunker-web.oci.tar | tee SHA256SUMS
+          echo "source commit: ${GITHUB_SHA}"
+          jq -c '{digest: ."containerimage.digest", config: ."containerimage.config.digest"}' server-meta.json web-meta.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sovereignbunker-images-${{ github.sha }}
+          path: |
+            sovereignbunker-server.oci.tar
+            sovereignbunker-web.oci.tar
+            SHA256SUMS
+            server-meta.json
+            web-meta.json
+          retention-days: 30
+          if-no-files-found: error
